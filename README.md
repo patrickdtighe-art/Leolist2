@@ -156,3 +156,19 @@ SCAN_MAX_CITY_PAGES=80
 SCAN_MAX_EMPTY_PAGES=4
 
 If it appears stuck, open the live status page and click Live logs. The last Heartbeat line tells you exactly what step is stuck.
+
+
+RAILWAY PORT FIX
+================
+This build fixes:
+Error: Invalid value for '--port': '$PORT' is not a valid integer.
+
+Use the included Dockerfile/railway.json/Procfile. If Railway still shows the same error,
+go to Railway > Service > Settings > Deploy > Start Command and set it exactly to:
+
+sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}'
+
+Do NOT use:
+uvicorn main:app --host 0.0.0.0 --port $PORT
+
+because Railway may pass $PORT literally unless it runs through a shell.
