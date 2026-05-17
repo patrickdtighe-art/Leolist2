@@ -218,3 +218,30 @@ HANDWRITING_POSSIBLE_THRESHOLD=0.58
 REVIEW_MODE_INCLUDE_ALL_AI_IMAGES=1
 SCAN_NAV_TIMEOUT_MS=25000
 SCAN_MAX_CITY_PAGES=80
+
+
+CLOUDFLARE-AWARE BUILD
+======================
+This build does not try to bypass Cloudflare/security verification.
+
+It detects Cloudflare/security verification pages and stops wasting scans on them.
+It also adds /manual so you can upload saved ad/sign images for review and handwriting comparison.
+
+If Railway receives Cloudflare instead of listings, the app writes:
+BLOCKED_BY_CLOUDFLARE.txt
+
+Manual fallback:
+1. Open /manual
+2. Upload saved ad/sign photos
+3. Review images and handwriting matches from the generated job pages
+
+
+PROFILE OPENING FIX
+===================
+Fixes sites such as CanadaEscorts where ads are opened through "View Profile" buttons.
+
+Changes:
+- treats View Profile / Profile / View Ad / Details buttons as individual ads
+- extracts href/data-url/onclick/card links
+- click-fallback records the navigated profile URL
+- avoids staying on the city results page and scanning only thumbnails

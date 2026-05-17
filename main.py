@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 from zipfile import ZipFile, ZIP_DEFLATED
 
 import httpx
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
 from openai import AsyncOpenAI
 from PIL import Image, ImageDraw, ImageOps, ImageFilter, ImageStat
@@ -538,6 +538,21 @@ async def run_step_with_timeout(coro, label: str, job: ScanJob | None = None, ti
         raise TimeoutError(msg)
 
 
+
+def looks_like_cloudflare_block(text: str, html: str = "") -> bool:
+    blob = ((text or "") + "\n" + (html or "")).lower()
+    indicators = [
+        "performing security verification",
+        "checking if the site connection is secure",
+        "verify you are human",
+        "cloudflare",
+        "cf-ray",
+        "security service to protect against malicious bots",
+        "challenge-platform",
+    ]
+    return any(x in blob for x in indicators)
+
+
 def html_escape(s: Any) -> str:
     import html
     return html.escape(str(s or ""))
@@ -647,6 +662,22 @@ def likely_ad_detail_link(url: str, city_base: str) -> bool:
         if len(extra) >= 8 and not extra.isdigit():
             return True
         return False
+
+    # CanadaEscorts and similar sites often use profile URLs/buttons rather than
+    # obvious ad IDs. Treat profile/view-profile links as individual ads.
+    host = u.netloc.lower()
+    if "canadaescorts" in host or "escort" in host:
+        strong_profile = any(token in upath for token in [
+            "profile", "view-profile", "viewprofile", "escort", "model", "girls", "ad", "listing"
+        ])
+        weak_city_page = any(token in upath for token in [
+            "city", "cities", "search", "category", "contact", "privacy", "terms", "login", "register"
+        ])
+        if strong_profile and not weak_city_page:
+            return True
+        if re.search(r"\d{4,}", upath + "?" + u.query):
+            return True
+
     return True
 
 
@@ -701,20 +732,31 @@ async def dismiss_common_modals(page):
             pass
 
 
+
 async def extract_links(page, base_url: str, max_links: int | None = None, city_base_url: str | None = None) -> list[str]:
+    """Extract real ad/profile links from listing pages.
+
+    Includes special handling for sites where the clickable target is a
+    "View Profile" button or a card onclick rather than a normal obvious ad URL.
+    """
     raw = await page.evaluate(
         """() => {
             const out = [];
-            const attrs = ["href","data-href","data-url","data-link","data-target","to"];
-            for (const el of document.querySelectorAll("a, [href], [data-href], [data-url], [data-link], [onclick], article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad']")) {
+            const attrs = ["href","data-href","data-url","data-link","data-target","to","onclick"];
+            const nodes = document.querySelectorAll(
+              "a, button, [role='button'], [href], [data-href], [data-url], [data-link], [onclick], article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad'], [class*='profile']"
+            );
+            for (const el of nodes) {
+                const text = (el.innerText || el.textContent || "").trim();
                 for (const a of attrs) {
                     const v = el.getAttribute && el.getAttribute(a);
-                    if (v) out.push(v);
+                    if (v) out.push({value:v, text});
                 }
-                const oc = el.getAttribute && el.getAttribute("onclick");
-                if (oc) out.push(oc);
-                const inner = el.querySelector && el.querySelector("a[href]");
-                if (inner && inner.href) out.push(inner.href);
+                if (el.href) out.push({value:el.href, text});
+                const innerLinks = el.querySelectorAll && el.querySelectorAll("a[href]");
+                if (innerLinks) {
+                    for (const a of innerLinks) out.push({value:a.href || a.getAttribute("href"), text:(a.innerText || text || "").trim()});
+                }
             }
             return out;
         }"""
@@ -723,42 +765,75 @@ async def extract_links(page, base_url: str, max_links: int | None = None, city_
     links = []
     seen = set()
     url_pat = re.compile(r"""https?://[^\s'"<>]+|/[A-Za-z0-9_./?=&%-]+""")
+
+    def add_link(href: str, text: str = ""):
+        href = urljoin(base_url, href).split("#")[0].rstrip(")")
+        if not href or href in seen:
+            return
+        low_text = (text or "").lower()
+        is_profile_text = any(t in low_text for t in ["view profile", "profile", "view ad", "details", "more info"])
+        is_detail = likely_ad_detail_link(href, city_base_url or base_url) if city_base_url else likely_detail_link(href, base_url)
+        # CanadaEscorts can have bland URLs but obvious profile button text.
+        if is_profile_text and same_site(href, base_url) and not bad_link_path(urlparse(href).path.lower()):
+            is_detail = True
+        if is_detail:
+            seen.add(href)
+            links.append(href)
+
     for item in raw:
-        for m in url_pat.findall(str(item)):
-            href = urljoin(base_url, m).split("#")[0].rstrip(")")
-            if href in seen:
-                continue
-            is_detail = likely_ad_detail_link(href, city_base_url or base_url) if city_base_url else likely_detail_link(href, base_url)
-            if is_detail:
-                seen.add(href)
-                links.append(href)
+        value = str(item.get("value", "") if isinstance(item, dict) else item)
+        text = str(item.get("text", "") if isinstance(item, dict) else "")
+        for m in url_pat.findall(value):
+            add_link(m, text)
             if max_links and len(links) >= max_links:
                 return links
 
+    # Stronger click fallback: click View Profile/profile buttons and record navigated URL.
     if (not max_links) or len(links) < max_links:
-        try:
-            handles = await page.query_selector_all("article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad']")
-            original = page.url
-            click_limit = (max_links * 3) if max_links else min(len(handles), 250)
-            for h in handles[:click_limit]:
+        selectors = [
+            "a:has-text('View Profile')",
+            "button:has-text('View Profile')",
+            "[role='button']:has-text('View Profile')",
+            "a:has-text('Profile')",
+            "button:has-text('Profile')",
+            "a:has-text('View Ad')",
+            "a:has-text('Details')",
+            ".listing a",
+            "[class*='listing'] a",
+            "[class*='profile'] a",
+            "article a",
+        ]
+        original = page.url
+        for sel in selectors:
+            try:
+                handles = await page.query_selector_all(sel)
+            except Exception:
+                continue
+            for h in handles[:250]:
                 if max_links and len(links) >= max_links:
-                    break
+                    return links
                 try:
-                    await h.click(timeout=1000)
-                    await page.wait_for_timeout(1000)
+                    href = await h.get_attribute("href")
+                    text = await h.inner_text(timeout=500)
+                except Exception:
+                    href, text = None, ""
+                if href:
+                    add_link(href, text)
+                    if max_links and len(links) >= max_links:
+                        return links
+                    continue
+                try:
+                    await h.scroll_into_view_if_needed(timeout=1000)
+                    await h.click(timeout=1500, force=True)
+                    await page.wait_for_timeout(900)
                     new_url = page.url.split("#")[0]
-                    is_detail = likely_ad_detail_link(new_url, city_base_url or base_url) if city_base_url else likely_detail_link(new_url, base_url)
-                    if new_url != original and new_url not in seen and is_detail:
-                        seen.add(new_url)
-                        links.append(new_url)
-                    if page.url != original:
+                    if new_url != original:
+                        add_link(new_url, text or "View Profile")
                         await page.goto(original, wait_until="domcontentloaded", timeout=20000)
                         await dismiss_common_modals(page)
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(600)
                 except Exception:
                     pass
-        except Exception:
-            pass
 
     return links[:max_links] if max_links else links
 
@@ -1218,9 +1293,16 @@ async def discover_city_listing_pages(context, start_url: str, max_links: int | 
             await run_step_with_timeout(auto_scroll(page, steps=14), "Scrolling city page for lazy-loaded ads", job, timeout=35)
             try:
                 write_debug_text(job, "latest_url.txt", city_url)
-                write_debug_text(job, "latest.html", await page.content())
-                write_debug_text(job, "latest_text.txt", await page.evaluate("document.body ? document.body.innerText : ''"))
+                latest_html = await page.content()
+                latest_text = await page.evaluate("document.body ? document.body.innerText : ''")
+                write_debug_text(job, "latest.html", latest_html)
+                write_debug_text(job, "latest_text.txt", latest_text)
                 write_debug_bytes(job, "latest-page.jpg", await page.screenshot(full_page=True, type="jpeg", quality=70))
+                if looks_like_cloudflare_block(latest_text, latest_html):
+                    msg = "Blocked by Cloudflare/security verification. Railway is receiving a verification page instead of Leolist listings."
+                    log_job(job, msg)
+                    write_debug_text(job, "BLOCKED_BY_CLOUDFLARE.txt", msg + "\nUse the manual upload/review workflow or run from an allowed environment.")
+                    return listing_links, pagination_pages_visited
             except Exception as dbg_e:
                 log_job(job, f"Debug capture failed: {dbg_e}")
 
@@ -1799,7 +1881,7 @@ window.addEventListener("DOMContentLoaded", updateMode);
           <span><b>Enable screenshot fallback</b><br><span class="help">Use only if no images are extracted. It can catch rendered images but may create false positives from webpage text.</span></span>
         </label>
 
-        <button class="btn" type="submit">Start full scanner</button>
+        <button class="btn" type="submit">Start full scanner</button><p class="help"><a href="/manual">Manual upload mode</a> for when Leolist shows Cloudflare verification on Railway.</p>
       </form>
     </section>
   </div>
@@ -2231,6 +2313,70 @@ async def handwriting_json(job_id: str):
     if not job:
         return JSONResponse({"error": "Job not found"}, status_code=404)
     return JSONResponse(build_handwriting_report(job))
+
+
+
+@app.get("/manual", response_class=HTMLResponse)
+async def manual_upload_page():
+    return """
+<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manual image upload</title>
+<style>body{font-family:Arial,sans-serif;background:#080b12;color:#eef4ff;padding:22px}a{color:#66e3ff}.card{background:#101621;border:1px solid #243145;border-radius:18px;padding:18px;max-width:780px}input,button{font-size:18px;margin-top:12px}button{padding:12px 16px;border-radius:12px;border:0}</style>
+</head><body><div class="card">
+<a href="/">Back</a>
+<h1>Manual upload scanner</h1>
+<p>Use this when Leolist blocks Railway with Cloudflare. Upload saved ad/sign images and the app will place them into a review job for detection/handwriting comparison.</p>
+<form method="post" action="/manual/upload" enctype="multipart/form-data">
+<input type="file" name="files" multiple accept="image/*"><br>
+<button type="submit">Upload images for review</button>
+</form>
+</div></body></html>
+"""
+
+@app.post("/manual/upload")
+async def manual_upload(files: list[UploadFile] = File(...)):
+    job_id = uuid.uuid4().hex[:12]
+    debug_dir = str(JOBS_ROOT / job_id)
+    job = ScanJob(
+        id=job_id,
+        created_at=time.time(),
+        status="done",
+        message="Manual images uploaded",
+        mode="manual_upload",
+        selected_city="manual upload",
+        target_url="manual upload",
+        max_links=0,
+        max_images=0,
+        screenshot_fallback=False,
+        debug_dir=debug_dir,
+    )
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+    d = Path(debug_dir) / "all_scanned_images"
+    d.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for f in files:
+        data = await f.read()
+        if not data:
+            continue
+        count += 1
+        suffix = Path(f.filename or "").suffix.lower()
+        if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
+            suffix = ".jpg"
+        (d / f"manual_{count:04d}{suffix}").write_bytes(data)
+    job.diagnostics = {
+        "mode": "manual_upload",
+        "images_scanned": count,
+        "likely_problem": "Manual upload mode: images saved for review/handwriting comparison.",
+    }
+    JOBS[job_id] = job
+    try:
+        hw = build_handwriting_report(job)
+        job.diagnostics["handwriting_images_compared"] = hw.get("image_count", 0)
+        job.diagnostics["handwriting_possible_pairs"] = hw.get("pair_count", 0)
+        job.diagnostics["handwriting_clusters"] = len(hw.get("clusters", []))
+    except Exception as e:
+        log_job(job, f"Handwriting comparison failed: {e}")
+    return RedirectResponse(url=f"/review/{job_id}", status_code=303)
 
 
 @app.get("/job/{job_id}.json")
