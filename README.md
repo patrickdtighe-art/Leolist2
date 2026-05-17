@@ -85,3 +85,74 @@ Useful debug links during a scan:
 - `/debug/<job_id>/opened_ad_urls.txt` ads actually opened
 - `/debug/<job_id>/all_image_urls.txt` cumulative image URLs found from opened ads
 - `/debug/<job_id>/latest-ad-page.jpg` screenshot of the latest opened ad
+
+
+FINAL WORKING DEBUG BUILD
+-------------------------
+This build saves evidence even when zero confirmed signs are found.
+
+After starting a scan, open:
+- /status/<job_id>
+- /debug/<job_id>/ai_verdicts.jsonl
+- /candidates/<job_id>.zip
+
+The candidates ZIP contains:
+- confirmed signs
+- possible signs
+- sampled scanned ad images
+
+If all_scanned_images contains sign photos but confirmed signs is empty, the AI detector is rejecting them.
+If all_scanned_images does not contain ad photos, the crawler/gallery extraction is the problem.
+
+
+
+PRO GUI FINAL BUILD
+===================
+
+What changed:
+- Polished mobile-friendly dashboard UI.
+- City selector and custom URL scan modes.
+- Full-city scanning with 0 = no cap.
+- Opens individual ad/detail pages instead of only city pages.
+- Live scan dashboard at /status/<job_id>.
+- Live logs at /logs/<job_id>.
+- Job JSON at /job/<job_id>.json.
+- Debug files are downloadable from the dashboard.
+- Confirmed signs ZIP at /signs/<job_id>.zip.
+- Possible signs + scanned sample images ZIP at /candidates/<job_id>.zip.
+- Saves AI verdict audit trail to ai_verdicts.jsonl.
+- Saves sampled scanned images so zero-result runs can be diagnosed.
+- Uses duplicate image/sign filtering.
+- Includes compile, backend smoke, and GUI smoke tests.
+
+Important:
+If confirmed signs are still zero:
+1. Download "Possible signs + scanned images ZIP".
+2. If sign photos are in all_scanned_images but not possible_signs, the AI rejected them.
+3. If sign photos are not in all_scanned_images, the crawler is not getting those gallery images from the site/Railway.
+4. Check latest-ad-page.jpg, opened_ad_urls.txt, all_image_urls.txt, and ai_verdicts.jsonl from the dashboard.
+
+Railway:
+Set OPENAI_API_KEY in Railway variables.
+Start command should be similar to:
+uvicorn main:app --host 0.0.0.0 --port $PORT
+
+
+NO-HANG BUILD
+=============
+This build adds:
+- hard timeout around Chromium launch
+- hard timeout around city-page navigation
+- hard timeout around individual-ad navigation
+- shorter lazy-load scroll loops
+- heartbeat logs every 20 seconds
+- pause/resume/cancel controls
+- Railway-safe crawl defaults
+
+Optional Railway variables:
+SCAN_NAV_TIMEOUT_MS=25000
+SCAN_STEP_TIMEOUT_SEC=90
+SCAN_MAX_CITY_PAGES=80
+SCAN_MAX_EMPTY_PAGES=4
+
+If it appears stuck, open the live status page and click Live logs. The last Heartbeat line tells you exactly what step is stuck.

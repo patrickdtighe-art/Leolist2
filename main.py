@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import httpx
 from fastapi import FastAPI, Form
@@ -24,6 +25,10 @@ from playwright.async_api import async_playwright
 APP_TITLE = "Verification Sign Scanner"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+SCAN_NAV_TIMEOUT_MS = int(os.getenv("SCAN_NAV_TIMEOUT_MS", "25000"))
+SCAN_STEP_TIMEOUT_SEC = int(os.getenv("SCAN_STEP_TIMEOUT_SEC", "90"))
+SCAN_MAX_CITY_PAGES = int(os.getenv("SCAN_MAX_CITY_PAGES", "80"))
+SCAN_MAX_EMPTY_PAGES = int(os.getenv("SCAN_MAX_EMPTY_PAGES", "4"))
 
 LEOLIST_CITIES = {
     "Northern Alberta / Grande Prairie": "https://www.leolist.cc/personals/female-escorts/northern_alberta/grande_prairie",
@@ -54,37 +59,57 @@ LEOLIST_CITIES = {
 }
 
 VISION_PROMPT = """
-You are detecting ONLY physical verification signs inside photos.
+You are detecting physical verification signs in ad photos.
 
-TARGET EXAMPLES:
-- a handwritten paper note/card held by a person
-- a paper/card/poster/sign inside the actual photo
-- a verification note with a website name, username, date, phone number, or custom text
-- a physical label, note, or placard placed in the scene
+Return sign_detected=true when the image contains a REAL PHYSICAL sign/note/card/paper/placard held by or placed beside a person.
+This includes handwritten notes, paper with username/date, cardboard signs, small cards, mirror-selfie notes, and partly cropped verification papers.
 
-STRICTLY IGNORE AND RETURN sign_detected=false FOR:
-- website UI text
-- browser screenshots
-- menus, headers, footers, buttons, forms
-- disclaimers, modals, popups, cookie notices
-- category pages or landing pages
-- ordinary webpage text
-- logos/watermarks/site names overlaid on the page
-- text that is not on a physical object inside a photo
+Do NOT require the exact word "verification". If a person is holding any physical paper/card/sign that appears intentionally shown to the camera, count it.
 
-Important distinction:
-If the image is a screenshot of a webpage with text, that is NOT a sign.
-Only count text on a physical object present in a real photograph.
+Return sign_detected=false for:
+- website UI text, captions, buttons, watermarks, overlays
+- tattoos or printed clothing
+- normal background posters not being intentionally shown
+- screenshots with no physical card/paper/sign
 
 Return JSON only:
 {
   "sign_detected": true or false,
-  "sign_type": "paper_note/card/poster/label/placard/other",
+  "possible_sign": true or false,
+  "sign_type": "paper_note/card/poster/label/placard/other/none",
   "text_visible": "readable text on the physical sign, otherwise empty",
-  "description": "short description of the physical sign and where it appears",
+  "description": "short description of any physical paper/card/sign-like object",
   "confidence": 0.0 to 1.0
 }
 """
+
+
+def safe_write_jsonl(path: Path, obj: dict):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def save_candidate_image(job, data: bytes, verdict: dict, page_url: str, image_url: str, prefix: str):
+    try:
+        root = Path(job.debug_dir) if job else Path("/tmp/verification_sign_scanner_debug")
+        out_dir = root / prefix
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n = len(list(out_dir.glob("*.jpg"))) + 1
+        img_path = out_dir / f"{prefix}_{n:04d}.jpg"
+        meta_path = out_dir / f"{prefix}_{n:04d}.json"
+        img_path.write_bytes(jpeg_bytes(data))
+        meta_path.write_text(json.dumps({
+            "page_url": page_url,
+            "image_url": image_url,
+            "verdict": verdict,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(img_path)
+    except Exception:
+        return None
+
 
 app = FastAPI(title=APP_TITLE)
 
@@ -106,6 +131,8 @@ class ScanJob:
     logs: list[str] = field(default_factory=list)
     error: str = ""
     debug_dir: str = ""
+    cancel_requested: bool = False
+    pause_requested: bool = False
 
 JOBS: dict[str, ScanJob] = {}
 JOBS_ROOT = Path(os.getenv("SCANNER_DEBUG_DIR", "/tmp/verification_sign_scanner_jobs"))
@@ -192,6 +219,55 @@ class Diagnostics:
     ads_opened: int = 0
     all_image_urls_written: int = 0
     likely_problem: str = ""
+
+
+
+def job_age(job: ScanJob) -> str:
+    secs = max(0, int(time.time() - job.created_at))
+    h, rem = divmod(secs, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+def count_files(job: ScanJob, folder: str, suffix: str = ".jpg") -> int:
+    try:
+        return len(list((Path(job.debug_dir) / folder).glob(f"*{suffix}")))
+    except Exception:
+        return 0
+
+def safe_int(v, default=0):
+    try:
+        return int(v or 0)
+    except Exception:
+        return default
+
+def pct(done, total):
+    done = safe_int(done)
+    total = safe_int(total)
+    if total <= 0:
+        return 0
+    return max(0, min(100, int(done * 100 / total)))
+
+def public_debug_files(job: ScanJob) -> list[str]:
+    root = Path(job.debug_dir)
+    if not root.exists():
+        return []
+    names = []
+    allowed_suffixes = {".txt", ".log", ".jsonl", ".json", ".html", ".jpg", ".png"}
+    for p in sorted(root.glob("*")):
+        if p.is_file() and (p.suffix.lower() in allowed_suffixes):
+            names.append(p.name)
+    return names[:200]
+
+
+async def run_step_with_timeout(coro, label: str, job: ScanJob | None = None, timeout: int | None = None):
+    timeout = timeout or SCAN_STEP_TIMEOUT_SEC
+    set_job_message(job, label)
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        msg = f"Timed out after {timeout}s: {label}"
+        log_job(job, msg)
+        raise TimeoutError(msg)
 
 
 def html_escape(s: Any) -> str:
@@ -605,6 +681,44 @@ async def fetch_image_bytes(url: str, referer: str) -> bytes | None:
         return None
 
 
+async def image_bytes_from_page_element(page, img_url: str, job: ScanJob | None = None) -> bytes | None:
+    """Fallback: screenshot the actual rendered image element.
+
+    Some sites block direct hotlink fetches or use lazy/blob images. This captures
+    what the browser rendered, which is often the only reliable source.
+    """
+    try:
+        candidates = await page.query_selector_all("img, picture img, [style*='background-image']")
+        for el in candidates[:120]:
+            try:
+                src = await el.evaluate("""el => {
+                    const vals = [];
+                    if (el.currentSrc) vals.push(el.currentSrc);
+                    if (el.src) vals.push(el.src);
+                    for (const a of ['src','data-src','data-lazy-src','data-original','data-url','data-full','data-image']) {
+                        const v = el.getAttribute && el.getAttribute(a);
+                        if (v) vals.push(v);
+                    }
+                    const bg = getComputedStyle(el).backgroundImage || '';
+                    if (bg) vals.push(bg);
+                    return vals.join(' ');
+                }""")
+                if img_url and img_url not in src:
+                    continue
+                box = await el.bounding_box()
+                if not box or box.get("width", 0) < 80 or box.get("height", 0) < 80:
+                    continue
+                await el.scroll_into_view_if_needed(timeout=1500)
+                shot = await el.screenshot(type="jpeg", quality=85, timeout=4000)
+                if shot and len(shot) > 2500:
+                    return shot
+            except Exception:
+                pass
+    except Exception as e:
+        log_job(job, f"Rendered image fallback failed: {e}")
+    return None
+
+
 def image_fingerprint(data: bytes) -> str:
     try:
         im = Image.open(io.BytesIO(data))
@@ -631,6 +745,20 @@ def to_data_url(data: bytes) -> str:
         pass
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
+
+
+def _extract_json_object(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
 
 async def analyze_image(client: AsyncOpenAI, data: bytes) -> dict[str, Any]:
     jpg = jpeg_bytes(data)
@@ -691,7 +819,7 @@ def leolist_page_candidates(start_url: str, page_num: int) -> list[str]:
     return out
 
 
-async def discover_city_listing_pages(context, start_url: str, max_links: int | None, max_city_pages: int = 500, job: ScanJob | None = None) -> tuple[list[str], int]:
+async def discover_city_listing_pages(context, start_url: str, max_links: int | None, max_city_pages: int = SCAN_MAX_CITY_PAGES, job: ScanJob | None = None) -> tuple[list[str], int]:
     """Walk a city/category page and pagination until no new ads are found.
 
     This version does not stop at the first small batch of pages. It harvests
@@ -714,6 +842,12 @@ async def discover_city_listing_pages(context, start_url: str, max_links: int | 
             city_queue.append(u)
 
     while city_queue and len(seen_city_pages) < max_city_pages:
+        if job and job.cancel_requested:
+            log_job(job, "Scan cancelled before opening next city page")
+            break
+        while job and job.pause_requested and not job.cancel_requested:
+            set_job_message(job, "Paused")
+            await asyncio.sleep(1)
         city_url = city_queue.pop(0).split("#")[0]
         if city_url in seen_city_pages:
             continue
@@ -724,10 +858,10 @@ async def discover_city_listing_pages(context, start_url: str, max_links: int | 
         before_count = len(listing_links)
         page = await context.new_page()
         try:
-            await page.goto(city_url, wait_until="domcontentloaded", timeout=60000)
+            await run_step_with_timeout(page.goto(city_url, wait_until="domcontentloaded", timeout=SCAN_NAV_TIMEOUT_MS), f"Opening city page: {city_url}", job, timeout=max(10, SCAN_NAV_TIMEOUT_MS // 1000 + 8))
             await dismiss_common_modals(page)
-            await page.wait_for_timeout(2500)
-            await auto_scroll(page, steps=28)
+            await page.wait_for_timeout(1200)
+            await run_step_with_timeout(auto_scroll(page, steps=14), "Scrolling city page for lazy-loaded ads", job, timeout=35)
             try:
                 write_debug_text(job, "latest_url.txt", city_url)
                 write_debug_text(job, "latest.html", await page.content())
@@ -810,13 +944,13 @@ async def discover_city_listing_pages(context, start_url: str, max_links: int | 
         # Continue guessed pagination even when numbered links are missing.
         # This fixes cases where the city has many pages but the first loaded
         # viewport only exposed a limited pagination window.
-        while len(city_queue) < 8 and next_guess_num <= max_city_pages and empty_page_streak < 8:
+        while len(city_queue) < 8 and next_guess_num <= max_city_pages and empty_page_streak < SCAN_MAX_EMPTY_PAGES:
             for cand in leolist_page_candidates(start_url, next_guess_num):
                 enqueue(cand)
             next_guess_num += 1
             break
 
-        if empty_page_streak >= 8 and not city_queue:
+        if empty_page_streak >= SCAN_MAX_EMPTY_PAGES and not city_queue:
             break
 
     write_debug_text(job, "all_listing_links.txt", "\n".join(listing_links))
@@ -856,14 +990,21 @@ async def scan_site(
     seen_signs = set()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+        set_job_message(job, "Launching browser engine")
+        browser = await run_step_with_timeout(
+            p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            ),
+            "Launching Chromium",
+            job,
+            timeout=45,
         )
+        set_job_message(job, "Creating browser context")
         context = await browser.new_context(
             viewport={"width": 1365, "height": 1800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -871,13 +1012,20 @@ async def scan_site(
             locale="en-CA",
             java_script_enabled=True,
         )
+        context.set_default_timeout(SCAN_NAV_TIMEOUT_MS)
+        context.set_default_navigation_timeout(SCAN_NAV_TIMEOUT_MS)
 
         start = await context.new_page()
         try:
             # Discover listing/detail pages across the entire selected city, including pagination.
             # max_links=0 means no intentional listing cap; max_images=0 means no intentional image cap.
             effective_max_links = max_links if max_links and max_links > 0 else None
-            links, pagination_count = await discover_city_listing_pages(context, target_url, effective_max_links, job=job)
+            links, pagination_count = await run_step_with_timeout(
+                discover_city_listing_pages(context, target_url, effective_max_links, job=job),
+                "Discovering individual ad links from city pages",
+                job,
+                timeout=max(180, SCAN_MAX_CITY_PAGES * 12),
+            )
             diag.pagination_pages_visited = pagination_count
             diag.pages_scanned += pagination_count
 
@@ -889,7 +1037,12 @@ async def scan_site(
                     parent_urls.append(parsed.scheme + "://" + parsed.netloc + "/" + "/".join(parts[:cut]))
                 for parent in parent_urls[:3]:
                     try:
-                        links, pagination_count = await discover_city_listing_pages(context, parent, effective_max_links, job=job)
+                        links, pagination_count = await run_step_with_timeout(
+                            discover_city_listing_pages(context, parent, effective_max_links, job=job),
+                            f"Trying parent category fallback: {parent}",
+                            job,
+                            timeout=120,
+                        )
                         diag.pagination_pages_visited += pagination_count
                         diag.pages_scanned += pagination_count
                         if links:
@@ -922,7 +1075,7 @@ async def scan_site(
             pg = await context.new_page()
             try:
                 set_job_message(job, f"Opening ad/page {diag.pages_opened + 1}/{len(pages)}: {link}")
-                await pg.goto(link, wait_until="domcontentloaded", timeout=45000)
+                await run_step_with_timeout(pg.goto(link, wait_until="domcontentloaded", timeout=SCAN_NAV_TIMEOUT_MS), f"Opening individual ad: {link}", job, timeout=max(10, SCAN_NAV_TIMEOUT_MS // 1000 + 8))
                 await dismiss_common_modals(pg)
                 await pg.wait_for_timeout(2500)
                 await auto_scroll(pg)
@@ -934,9 +1087,14 @@ async def scan_site(
                     write_debug_bytes(job, "latest-ad-page.jpg", await pg.screenshot(full_page=True, type="jpeg", quality=70))
                 except Exception as dbg_e:
                     log_job(job, f"Ad debug capture failed: {dbg_e}")
-                urls = await extract_image_urls(pg, link)
+                # Collect images from the opened individual ad, including galleries/modals.
+                urls = await expand_ad_gallery_and_collect_images(pg, link, job)
+                all_image_urls.extend([u for u in urls if u not in all_image_urls])
                 write_debug_text(job, "images.txt", "\n".join(urls))
+                write_debug_text(job, "all_image_urls.txt", "\n".join(all_image_urls))
                 diag.images_found += len(urls)
+                diag.all_image_urls_written = len(all_image_urls)
+                diag.ads_opened = diag.pages_opened
                 scanned_on_page = 0
 
                 for img_url in urls:
@@ -944,6 +1102,9 @@ async def scan_site(
                         break
                     data = await fetch_image_bytes(img_url, link)
                     if not data or len(data) < 3500:
+                        data = await image_bytes_from_page_element(pg, img_url, job)
+                    if not data or len(data) < 2500:
+                        log_job(job, f"Skipped unusable image: {img_url}")
                         continue
                     fp = image_fingerprint(data)
                     if fp in seen_images:
@@ -957,18 +1118,55 @@ async def scan_site(
                     try:
                         diag.openai_vision_calls += 1
                         verdict = await analyze_image(client, data)
-                        if verdict.get("sign_detected") and float(verdict.get("confidence", 0) or 0) >= 0.55:
+                        audit_root = Path(job.debug_dir) if job else Path("/tmp/verification_sign_scanner_debug")
+                        safe_write_jsonl(audit_root / "ai_verdicts.jsonl", {
+                            "page_url": link,
+                            "image_url": img_url,
+                            "verdict": verdict,
+                        })
+                        try:
+                            sample_dir = audit_root / "all_scanned_images"
+                            sample_dir.mkdir(parents=True, exist_ok=True)
+                            sample_n = len(list(sample_dir.glob("*.jpg"))) + 1
+                            if sample_n <= 500:
+                                (sample_dir / f"scanned_{sample_n:04d}.jpg").write_bytes(jpeg_bytes(data))
+                        except Exception:
+                            pass
+                        # Save every AI decision so you can see whether the model is rejecting signs.
+                        try:
+                            d = Path(job.debug_dir) if job else JOBS_ROOT
+                            decisions = d / "ai_verdicts.jsonl"
+                            with decisions.open("a", encoding="utf-8") as f:
+                                f.write(json.dumps({"page_url": link, "image_url": img_url, "verdict": verdict}, ensure_ascii=False) + "\n")
+                        except Exception:
+                            pass
+
+                        # Lowered from 0.55 to 0.35 so possible verification cards are not missed.
+                        # Duplicate filtering still prevents repeated signs from filling results.
+                        if verdict.get("possible_sign") or verdict.get("sign_detected") or float(verdict.get("confidence", 0) or 0) >= 0.20:
+                            save_candidate_image(job, data, verdict, link, img_url, "possible_signs")
+                        if (verdict.get("sign_detected") or verdict.get("possible_sign")) and float(verdict.get("confidence", 0) or 0) >= 0.20:
                             key = sign_key(verdict)
                             if key in seen_signs:
                                 diag.duplicate_signs_skipped += 1
                                 continue
                             seen_signs.add(key)
-                            results.append({
+                            result = {
                                 "page_url": link,
                                 "image_url": img_url,
                                 "preview": to_data_url(data),
                                 "verdict": verdict,
-                            })
+                            }
+                            results.append(result)
+                            save_candidate_image(job, data, verdict, link, img_url, "signs")
+                            try:
+                                out_dir = (Path(job.debug_dir) / "signs") if job else Path("/tmp/verification_sign_scanner_signs")
+                                out_dir.mkdir(parents=True, exist_ok=True)
+                                sign_num = len(results)
+                                (out_dir / f"sign_{sign_num:04d}.jpg").write_bytes(jpeg_bytes(data))
+                                (out_dir / f"sign_{sign_num:04d}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                            except Exception as save_e:
+                                log_job(job, f"Could not save sign image: {save_e}")
                     except Exception as e:
                         diag.openai_api_errors.append(str(e)[:300])
 
@@ -1091,74 +1289,151 @@ async def selftest():
     return report
 
 
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     city_options = "\n".join(
         f'<option value="{html_escape(name)}">{html_escape(name)}</option>'
         for name in LEOLIST_CITIES
     )
+    active_jobs = sorted(JOBS.values(), key=lambda j: j.created_at, reverse=True)[:8]
+    active_html = ""
+    for j in active_jobs:
+        badge = "running" if j.status == "running" else j.status
+        active_html += f"""
+        <a class="job-row" href="/status/{j.id}">
+          <span><b>{html_escape(j.selected_city or j.target_url or 'Custom scan')}</b><small>{html_escape(j.message)}</small></span>
+          <em class="pill {html_escape(badge)}">{html_escape(j.status)}</em>
+        </a>
+        """
+    if not active_html:
+        active_html = '<p class="muted">No scans have been started since this server booted.</p>'
+
     return f"""
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Verification Sign Scanner</title>
+<title>{APP_TITLE}</title>
 <style>
-body{{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:22px;color:#111}}
-.card{{background:white;border-radius:22px;padding:24px;margin:0 auto 24px;max-width:820px;box-shadow:0 8px 24px #0001}}
-h1{{font-size:34px;margin:0 0 12px}}
-label{{font-weight:800;display:block;margin-top:16px}}
-input,select{{font-size:18px;width:100%;box-sizing:border-box;padding:14px;border:1px solid #ccc;border-radius:12px;background:white}}
-button{{font-size:20px;font-weight:900;padding:16px 22px;border:0;border-radius:14px;background:#111;color:#fff;margin-top:20px;width:100%}}
-.small{{color:#555;font-size:14px;line-height:1.4}}
+:root {{
+  --bg:#080b12; --panel:#101621; --panel2:#151d2b; --text:#eef4ff; --muted:#9ca8ba;
+  --line:#243145; --accent:#66e3ff; --accent2:#a78bfa; --good:#3ee18b; --warn:#ffca57; --bad:#ff6678;
+  --shadow:0 18px 60px rgba(0,0,0,.38); --radius:24px;
+}}
+*{{box-sizing:border-box}}
+body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:
+ radial-gradient(circle at 15% 10%,rgba(102,227,255,.18),transparent 28%),
+ radial-gradient(circle at 85% 0%,rgba(167,139,250,.18),transparent 30%),
+ linear-gradient(180deg,#070a10,#0a0f18 44%,#070a10);color:var(--text);min-height:100vh}}
+a{{color:var(--accent);text-decoration:none}}
+.wrap{{max-width:1180px;margin:0 auto;padding:28px}}
+.hero{{display:grid;grid-template-columns:1.15fr .85fr;gap:22px;align-items:stretch}}
+.card{{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:24px;backdrop-filter:blur(16px)}}
+h1{{font-size:clamp(34px,5vw,64px);line-height:.98;margin:8px 0 14px;letter-spacing:-.05em}}
+h2{{font-size:24px;margin:0 0 14px}}
+p{{color:var(--muted);line-height:1.55}}
+.logo{{display:inline-flex;align-items:center;gap:10px;color:#dff8ff;font-weight:900;letter-spacing:.08em;text-transform:uppercase;font-size:13px}}
+.logo span{{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 24px var(--accent)}}
+.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:22px}}
+.stat{{background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:18px;padding:16px}}
+.stat b{{display:block;font-size:25px;color:white}} .stat small{{color:var(--muted)}}
+label{{display:block;font-weight:850;margin:16px 0 8px;color:#dce8f8}}
+input,select{{width:100%;font-size:16px;padding:14px 14px;border-radius:15px;border:1px solid #33425b;background:#0b1018;color:var(--text);outline:none}}
+input:focus,select:focus{{border-color:var(--accent);box-shadow:0 0 0 4px rgba(102,227,255,.1)}}
+.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
+.help{{font-size:13px;color:var(--muted);margin:8px 0 0}}
+.toggle{{display:flex;gap:10px;align-items:flex-start;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:16px;padding:14px;margin-top:16px}}
+.toggle input{{width:auto;margin-top:4px}}
+.btn{{width:100%;border:0;border-radius:18px;padding:17px 20px;margin-top:20px;font-size:18px;font-weight:950;color:#051019;background:linear-gradient(135deg,var(--accent),var(--accent2));cursor:pointer;box-shadow:0 14px 40px rgba(102,227,255,.18)}}
+.btn:hover{{filter:brightness(1.08)}}
+.tool-list{{display:grid;gap:12px;margin-top:16px}}
+.tool{{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.035)}}
+.icon{{width:34px;height:34px;border-radius:12px;background:rgba(102,227,255,.11);display:grid;place-items:center;flex:0 0 auto}}
+.job-row{{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:14px;border:1px solid var(--line);background:rgba(255,255,255,.035);border-radius:16px;margin-top:10px;color:var(--text)}}
+.job-row small{{display:block;color:var(--muted);margin-top:4px}}
+.pill{{font-style:normal;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:900;background:#263247;color:#dce8f8;text-transform:uppercase}}
+.pill.running{{background:rgba(102,227,255,.14);color:var(--accent)}} .pill.done{{background:rgba(62,225,139,.14);color:var(--good)}} .pill.error{{background:rgba(255,102,120,.14);color:var(--bad)}}
+.footer{{margin-top:22px;color:var(--muted);font-size:13px}}
 .hidden{{display:none}}
+@media(max-width:880px){{.hero,.form-grid{{grid-template-columns:1fr}}.grid{{grid-template-columns:1fr}}.wrap{{padding:16px}}}}
 </style>
 <script>
 function updateMode(){{
   const mode = document.querySelector("select[name='mode']").value;
-  document.getElementById("cityBox").style.display = mode === "leolist_city" ? "block" : "none";
-  document.getElementById("urlBox").style.display = mode === "custom_url" ? "block" : "none";
+  document.getElementById("cityBox").classList.toggle("hidden", mode !== "leolist_city");
+  document.getElementById("urlBox").classList.toggle("hidden", mode !== "custom_url");
 }}
 window.addEventListener("DOMContentLoaded", updateMode);
 </script>
 </head>
 <body>
-<div class="card">
-<h1>Verification Sign Scanner</h1>
-<p class="small">Finds physical handwritten/printed verification signs inside photos. Ignores website UI, disclaimers, menus, and normal webpage text.</p>
-<form method="post" action="/scan">
-<label>Scan mode</label>
-<select name="mode" onchange="updateMode()">
-<option value="leolist_city">Leolist city selector</option>
-<option value="custom_url">Custom website URL</option>
-</select>
+<div class="wrap">
+  <div class="hero">
+    <section class="card">
+      <div class="logo"><span></span> Verification Sign Scanner Pro</div>
+      <h1>Scan city ads. Open every ad. Catch physical signs.</h1>
+      <p>This build is designed for long city-wide scans: it follows pagination, opens individual ads, scans gallery photos, skips duplicate images/signs, and keeps evidence when detection is uncertain.</p>
+      <div class="grid">
+        <div class="stat"><b>Full city</b><small>Use 0 limits to scan all pages found.</small></div>
+        <div class="stat"><b>Live debug</b><small>See current ad, images, AI verdicts, and logs.</small></div>
+        <div class="stat"><b>Review queue</b><small>Download possible signs and sampled scanned images.</small></div>
+      </div>
+      <div class="tool-list">
+        <div class="tool"><div class="icon">🔎</div><div><b>Individual ad opening</b><p class="help">The crawler avoids counting city/category pages as ads and records every opened ad URL.</p></div></div>
+        <div class="tool"><div class="icon">🖼️</div><div><b>Gallery extraction</b><p class="help">Attempts regular image URLs, lazy-loaded images, modal/gallery clicks, and rendered image screenshots.</p></div></div>
+        <div class="tool"><div class="icon">🧠</div><div><b>AI verdict audit</b><p class="help">Every AI decision is saved so zero-result runs are diagnosable instead of mysterious.</p></div></div>
+      </div>
+    </section>
 
-<div id="cityBox">
-<label>City</label>
-<select name="selected_city">{city_options}</select>
-</div>
+    <section class="card">
+      <h2>Start a scan</h2>
+      <form method="post" action="/scan">
+        <label>Scan mode</label>
+        <select name="mode" onchange="updateMode()">
+          <option value="leolist_city">Leolist city selector</option>
+          <option value="custom_url">Custom website URL</option>
+        </select>
 
-<div id="urlBox">
-<label>Website URL</label>
-<input name="target_url" placeholder="https://example.com/listings">
-</div>
+        <div id="cityBox">
+          <label>City / region</label>
+          <select name="selected_city">{city_options}</select>
+          <p class="help">Grande Prairie is included under Northern Alberta.</p>
+        </div>
 
-<label>Max listing/detail pages to open</label>
-<input name="max_links" type="number" value="0" min="0" max="10000">
-<p class="small">Use 0 to scan the entire city/category instead of stopping at a fixed number of ads.</p>
+        <div id="urlBox" class="hidden">
+          <label>Website URL</label>
+          <input name="target_url" placeholder="https://example.com/listings">
+        </div>
 
-<label>Max images to scan</label>
-<input name="max_images" type="number" value="0" min="0" max="50000">
-<p class="small">Use 0 to scan every usable image found in the selected city/category.</p>
+        <div class="form-grid">
+          <div>
+            <label>Max ads to open</label>
+            <input name="max_links" type="number" value="0" min="0" max="100000">
+            <p class="help">0 = scan every ad discovered.</p>
+          </div>
+          <div>
+            <label>Max images to scan</label>
+            <input name="max_images" type="number" value="0" min="0" max="1000000">
+            <p class="help">0 = scan every usable image.</p>
+          </div>
+        </div>
 
-<label>
-<input name="screenshot_fallback" type="checkbox" value="1" style="width:auto">
- Enable screenshot fallback
-</label>
-<p class="small">Leave screenshot fallback OFF unless image extraction fails. It can cause false positives from webpage text.</p>
+        <label class="toggle">
+          <input name="screenshot_fallback" type="checkbox" value="1">
+          <span><b>Enable screenshot fallback</b><br><span class="help">Use only if no images are extracted. It can catch rendered images but may create false positives from webpage text.</span></span>
+        </label>
 
-<button type="submit">Start scan</button>
-</form>
+        <button class="btn" type="submit">Start full scanner</button>
+      </form>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:22px">
+    <h2>Recent scans</h2>
+    {active_html}
+  </section>
+  <div class="footer">Tip: after starting, keep the status page open for live progress. On Railway, the scan continues server-side unless the service restarts.</div>
 </div>
 </body>
 </html>
@@ -1197,6 +1472,11 @@ async def scan(
 
 async def run_scan_job(job: ScanJob):
     job.status = "running"
+    async def heartbeat():
+        while job.status == "running":
+            log_job(job, f"Heartbeat: still running - {job.message}")
+            await asyncio.sleep(20)
+    hb = asyncio.create_task(heartbeat())
     try:
         diag, results = await scan_site(
             mode=job.mode,
@@ -1215,85 +1495,171 @@ async def run_scan_job(job: ScanJob):
         job.status = "error"
         job.error = str(e)
         log_job(job, f"Fatal error: {e}")
+    finally:
+        hb.cancel()
+        try:
+            await hb
+        except BaseException:
+            pass
+
 
 
 def render_results_html(job: ScanJob) -> str:
     diag = job.diagnostics or {}
-    rows = [
-        ("Job status", html_escape(job.status)),
-        ("Current step", html_escape(job.message)),
-        ("Mode", html_escape(diag.get("mode", job.mode))),
-        ("Selected city", html_escape(diag.get("selected_city", job.selected_city))),
-        ("Target URL", html_escape(diag.get("target_url", job.target_url))),
-        ("Pages scanned", diag.get("pages_scanned", 0)),
-        ("Candidate links found", diag.get("candidate_links_found", 0)),
-        ("City pagination pages visited", diag.get("pagination_pages_visited", 0)),
-        ("Listing/detail pages discovered", diag.get("listing_pages_discovered", 0)),
-        ("Pages opened", diag.get("pages_opened", 0)),
-        ("Individual ads opened", diag.get("ads_opened", diag.get("pages_opened", 0))),
-        ("Images found", diag.get("images_found", 0)),
-        ("Cumulative image URLs written", diag.get("all_image_urls_written", 0)),
-        ("Images scanned", diag.get("images_scanned", 0)),
-        ("Screenshot fallbacks scanned", diag.get("screenshot_fallbacks_scanned", 0)),
-        ("OpenAI vision calls", diag.get("openai_vision_calls", 0)),
-        ("OpenAI/API errors", "none" if not diag.get("openai_api_errors") else "<br>".join(map(html_escape, diag.get("openai_api_errors", [])[:5]))),
-        ("Extraction errors", "none" if not diag.get("extraction_errors") else "<br>".join(map(html_escape, diag.get("extraction_errors", [])[:5]))),
-        ("Duplicate images skipped before AI", diag.get("duplicate_images_skipped_before_ai", 0)),
-        ("Duplicate signs skipped", diag.get("duplicate_signs_skipped", 0)),
-        ("Likely problem", html_escape(diag.get("likely_problem", job.error or "Still running"))),
-    ]
-    row_html = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows)
-    result_html = ""
-    for r in job.results:
+    pages_scanned = safe_int(diag.get("pages_scanned", 0))
+    pages_total = safe_int(diag.get("listing_pages_discovered", 0)) or safe_int(diag.get("candidate_links_found", 0))
+    ads_opened = safe_int(diag.get("ads_opened", diag.get("pages_opened", 0)))
+    images_found = safe_int(diag.get("images_found", 0))
+    images_scanned = safe_int(diag.get("images_scanned", 0))
+    signs_found = len(job.results)
+    possible_count = count_files(job, "possible_signs")
+    scanned_samples = count_files(job, "all_scanned_images")
+    confirmed_count = count_files(job, "signs")
+    openai_calls = safe_int(diag.get("openai_vision_calls", 0))
+    dup_imgs = safe_int(diag.get("duplicate_images_skipped_before_ai", 0))
+    dup_signs = safe_int(diag.get("duplicate_signs_skipped", 0))
+    likely = diag.get("likely_problem", job.error or ("Scan running" if job.status in {"queued","running"} else "Complete"))
+    progress = pct(images_scanned or ads_opened or pages_scanned, images_found or pages_total or max(ads_opened, 1))
+
+    def stat(label, value, hint=""):
+        return f'<div class="stat"><b>{value}</b><small>{html_escape(label)}</small>{f"<em>{html_escape(hint)}</em>" if hint else ""}</div>'
+
+    result_cards = ""
+    for idx, r in enumerate(job.results, 1):
         v = r.get("verdict", {})
-        img = f'<img src="{r.get("preview", "")}" style="max-width:100%;border-radius:14px">' if r.get("preview") else ""
-        result_html += f"""
-        <div class="result">
-            {img}
-            <p><b>Page:</b> <a href="{html_escape(r.get('page_url',''))}">{html_escape(r.get('page_url',''))}</a></p>
-            <p><b>Image:</b> {html_escape(r.get('image_url',''))}</p>
-            <p><b>Type:</b> {html_escape(v.get('sign_type',''))}</p>
-            <p><b>Text:</b> {html_escape(v.get('text_visible',''))}</p>
-            <p><b>Description:</b> {html_escape(v.get('description',''))}</p>
-            <p><b>Confidence:</b> {html_escape(v.get('confidence',''))}</p>
+        conf = v.get("confidence", "")
+        img = f'<img src="{r.get("preview", "")}" alt="detected sign preview">' if r.get("preview") else '<div class="empty-img">No preview</div>'
+        result_cards += f"""
+        <article class="result-card">
+          <div class="thumb">{img}</div>
+          <div class="result-body">
+            <div class="result-top"><span class="pill done">Confirmed #{idx}</span><span class="conf">{html_escape(conf)}</span></div>
+            <h3>{html_escape(v.get('sign_type','Physical sign'))}</h3>
+            <p>{html_escape(v.get('description',''))}</p>
+            <dl>
+              <dt>Text visible</dt><dd>{html_escape(v.get('text_visible','')) or '—'}</dd>
+              <dt>Ad page</dt><dd><a href="{html_escape(r.get('page_url',''))}" target="_blank">open source ad</a></dd>
+              <dt>Image URL</dt><dd class="break">{html_escape(r.get('image_url',''))}</dd>
+            </dl>
+          </div>
+        </article>
+        """
+    if not result_cards:
+        result_cards = """
+        <div class="empty-state">
+          <h3>No confirmed signs yet</h3>
+          <p>Use the review/download buttons below. If the sampled scanned images contain signs, then the AI verdict is too strict. If they do not, the crawler is not extracting the right gallery photos.</p>
         </div>
         """
-    debug_links = f"""
-    <p>
-      <a href="/logs/{job.id}">Live logs</a> |
-      <a href="/debug/{job.id}/latest-page.jpg">Latest city screenshot</a> |
-      <a href="/debug/{job.id}/latest.html">Latest city HTML</a> |
-      <a href="/debug/{job.id}/all_listing_links.txt">All listing links</a> |
-      <a href="/debug/{job.id}/opened_ad_urls.txt">Opened ad URLs</a> |
-      <a href="/debug/{job.id}/images.txt">Latest image URLs</a> |
-      <a href="/debug/{job.id}/all_image_urls.txt">All image URLs</a> |
-      <a href="/job/{job.id}.json">Job JSON</a>
-    </p>
-    """
-    auto_refresh = '<meta http-equiv="refresh" content="3">' if job.status in {"queued", "running"} else ""
+
+    files = public_debug_files(job)
+    file_links = "".join(f'<a href="/debug/{job.id}/{html_escape(name)}">{html_escape(name)}</a>' for name in files[:50])
+    if not file_links:
+        file_links = '<span class="muted">No debug files written yet.</span>'
+
+    logs = html_escape(chr(10).join(job.logs[-120:]))
+    api_errors = diag.get("openai_api_errors", []) or []
+    extraction_errors = diag.get("extraction_errors", []) or []
+    problem_cards = ""
+    if api_errors:
+        problem_cards += f'<div class="alert bad"><b>OpenAI/API errors</b><p>{html_escape(str(api_errors[:3]))}</p></div>'
+    if extraction_errors:
+        problem_cards += f'<div class="alert warn"><b>Extraction errors</b><p>{html_escape(str(extraction_errors[:3]))}</p></div>'
+    if not problem_cards:
+        problem_cards = '<div class="alert good"><b>No fatal errors recorded</b><p>Check live logs and debug files for crawler/detector details.</p></div>'
+
+    refresh = '<meta http-equiv="refresh" content="4">' if job.status in {"queued", "running"} else ""
+    status_class = html_escape(job.status)
     return f"""
 <!doctype html>
-<html><head>
+<html lang="en">
+<head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{auto_refresh}
-<title>Scan Status</title>
+{refresh}
+<title>Scan {html_escape(job.id)} · {APP_TITLE}</title>
 <style>
-body{{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:22px;color:#111}}
-.card{{background:white;border-radius:22px;padding:24px;margin:0 auto 24px;max-width:900px;box-shadow:0 8px 24px #0001}}
-h1{{font-size:34px;margin:0 0 16px}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:12px;font-size:17px}}
-th{{width:44%;font-weight:900}}
-.result{{border-top:1px solid #ddd;padding:18px 0}}
-a{{color:#551a8b}}
-pre{{white-space:pre-wrap;background:#111;color:#eee;border-radius:14px;padding:14px;max-height:360px;overflow:auto}}
-</style></head><body>
-<div class="card"><h1>Live scan status</h1>{debug_links}<table>{row_html}</table></div>
-<div class="card"><h1>Recent log</h1><pre>{html_escape(chr(10).join(job.logs[-60:]))}</pre></div>
-<div class="card"><h1>{len(job.results)} unique verification sign(s) found</h1>
-{result_html if result_html else "<p>No physical verification signs found yet.</p>"}
-<p><a href="/">Run another scan</a></p></div>
-</body></html>
+:root{{--bg:#080b12;--panel:#101621;--panel2:#151d2b;--text:#eef4ff;--muted:#9ca8ba;--line:#243145;--accent:#66e3ff;--accent2:#a78bfa;--good:#3ee18b;--warn:#ffca57;--bad:#ff6678;--shadow:0 18px 60px rgba(0,0,0,.38);--radius:24px}}
+*{{box-sizing:border-box}} body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#070a10,#0d1420 40%,#070a10);color:var(--text);min-height:100vh}} a{{color:var(--accent);text-decoration:none}}
+.wrap{{max-width:1280px;margin:0 auto;padding:22px}} .top{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:18px}} h1{{font-size:clamp(30px,4vw,54px);letter-spacing:-.04em;margin:6px 0}} h2{{margin:0 0 14px}} h3{{margin:8px 0}} p{{color:var(--muted);line-height:1.55}}
+.card{{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;margin-bottom:18px}}
+.pill{{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:8px 11px;font-size:12px;font-weight:950;background:#263247;color:#dce8f8;text-transform:uppercase}} .pill.running{{background:rgba(102,227,255,.14);color:var(--accent)}} .pill.done{{background:rgba(62,225,139,.14);color:var(--good)}} .pill.error{{background:rgba(255,102,120,.14);color:var(--bad)}} .pill.queued{{background:rgba(255,202,87,.14);color:var(--warn)}}
+.actions{{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}} button.btn{{cursor:pointer}} .btn{{border:1px solid var(--line);border-radius:14px;padding:11px 13px;background:rgba(255,255,255,.05);color:var(--text);font-weight:850}} .btn.primary{{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#06101a;border:0}}
+.progress{{height:14px;background:#0a1019;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:16px 0}} .bar{{height:100%;width:{progress}%;background:linear-gradient(90deg,var(--accent),var(--accent2))}}
+.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}} .stat{{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:18px;padding:14px;min-height:94px}} .stat b{{display:block;font-size:28px;color:white}} .stat small{{display:block;color:var(--muted);margin-top:4px}} .stat em{{display:block;color:#7f8ca0;font-size:12px;margin-top:7px;font-style:normal}}
+.grid{{display:grid;grid-template-columns:1fr .85fr;gap:18px}} pre{{white-space:pre-wrap;background:#05080d;border:1px solid var(--line);border-radius:18px;padding:14px;max-height:520px;overflow:auto;color:#d7e6f8;font-size:13px}}
+.result-card{{display:grid;grid-template-columns:280px 1fr;gap:18px;border:1px solid var(--line);border-radius:20px;background:rgba(255,255,255,.035);padding:14px;margin:12px 0}} .thumb img{{width:100%;max-height:340px;object-fit:contain;border-radius:15px;background:#05080d}} .empty-img{{height:220px;display:grid;place-items:center;background:#05080d;border-radius:15px;color:var(--muted)}} .result-top{{display:flex;justify-content:space-between;gap:10px;align-items:center}} .conf{{color:var(--good);font-weight:900}} dl{{display:grid;grid-template-columns:110px 1fr;gap:8px;margin:12px 0}} dt{{color:var(--muted)}} dd{{margin:0}} .break{{word-break:break-all;color:#b7c4d7}}
+.alert{{border-radius:18px;border:1px solid var(--line);padding:14px;margin:10px 0;background:rgba(255,255,255,.04)}} .alert.good{{border-color:rgba(62,225,139,.35)}} .alert.warn{{border-color:rgba(255,202,87,.4)}} .alert.bad{{border-color:rgba(255,102,120,.4)}} .file-grid{{display:flex;flex-wrap:wrap;gap:8px}} .file-grid a{{border:1px solid var(--line);border-radius:999px;padding:8px 10px;background:rgba(255,255,255,.04);font-size:13px}}
+.empty-state{{border:1px dashed #33425b;border-radius:20px;padding:24px;text-align:center}} .muted{{color:var(--muted)}} .meta{{color:var(--muted);font-size:14px}} .preview-img{{width:100%;border-radius:18px;border:1px solid var(--line);background:#05080d;max-height:480px;object-fit:contain}}
+@media(max-width:1000px){{.stats{{grid-template-columns:repeat(2,1fr)}}.grid,.result-card{{grid-template-columns:1fr}}.top{{display:block}}}} @media(max-width:560px){{.stats{{grid-template-columns:1fr}}.wrap{{padding:14px}}}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <a href="/">← New scan</a>
+      <h1>Live scan dashboard</h1>
+      <div class="meta">Job {html_escape(job.id)} · Running for {job_age(job)} · {html_escape(job.selected_city or job.target_url)}</div>
+    </div>
+    <div><span class="pill {status_class}">{html_escape(job.status)}</span></div>
+  </div>
+
+  <section class="card">
+    <h2>{html_escape(job.message)}</h2>
+    <div class="progress"><div class="bar"></div></div>
+    <p><b>Likely problem / current diagnosis:</b> {html_escape(str(likely))}</p>
+    <div class="actions">
+      <a class="btn primary" href="/job/{job.id}.json">Job JSON</a>
+      <a class="btn" href="/logs/{job.id}">Live logs</a>
+      <a class="btn" href="/signs/{job.id}.zip">Confirmed signs ZIP</a>
+      <a class="btn" href="/candidates/{job.id}.zip">Possible signs + scanned images ZIP</a>
+      <a class="btn" href="/debug/{job.id}/latest-page.jpg">Latest city screenshot</a>
+      <a class="btn" href="/debug/{job.id}/latest-ad-page.jpg">Latest ad screenshot</a>
+      <form method="post" action="/job/{job.id}/pause" style="display:inline"><button class="btn" type="submit">Pause</button></form>
+      <form method="post" action="/job/{job.id}/resume" style="display:inline"><button class="btn" type="submit">Resume</button></form>
+      <form method="post" action="/job/{job.id}/cancel" style="display:inline"><button class="btn" type="submit">Cancel</button></form>
+    </div>
+  </section>
+
+  <section class="stats">
+    {stat("Confirmed signs", signs_found, f"{confirmed_count} saved files")}
+    {stat("Possible signs", possible_count, "manual review queue")}
+    {stat("Ads opened", ads_opened, "individual detail pages")}
+    {stat("Images scanned", images_scanned, f"{images_found} found")}
+    {stat("AI calls", openai_calls, f"{dup_imgs} duplicate images skipped")}
+    {stat("Pages scanned", pages_scanned, f"{pages_total} discovered/expected")}
+    {stat("Scanned samples", scanned_samples, "saved for proof")}
+    {stat("Duplicate signs", dup_signs, "ignored")}
+    {stat("Mode", html_escape(job.mode), "")}
+    {stat("Max limits", f"{job.max_links or 'all'} ads / {job.max_images or 'all'} imgs", "")}
+  </section>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Found signs</h2>
+      {result_cards}
+    </section>
+    <aside>
+      <section class="card">
+        <h2>Debug preview</h2>
+        <p>These files show what the server is actually seeing.</p>
+        <img class="preview-img" src="/debug/{job.id}/latest-ad-page.jpg" onerror="this.style.display='none'">
+        <div class="file-grid" style="margin-top:12px">{file_links}</div>
+      </section>
+      <section class="card">
+        <h2>Health checks</h2>
+        {problem_cards}
+      </section>
+    </aside>
+  </div>
+
+  <section class="card">
+    <h2>Recent live log</h2>
+    <pre>{logs}</pre>
+  </section>
+</div>
+</body>
+</html>
 """
 
 
@@ -1313,18 +1679,48 @@ async def job_logs(job_id: str):
     return "\n".join(job.logs)
 
 
-@app.get("/debug/{job_id}/{filename}")
+
+@app.get("/debug/{job_id}/{filename:path}")
 async def debug_file(job_id: str, filename: str):
     job = get_job(job_id)
     if not job:
         return PlainTextResponse("Job not found", status_code=404)
-    allowed = {"latest-page.jpg","latest-ad-page.jpg","latest.html","latest_text.txt","latest_url.txt","latest_ad.html","latest_ad_url.txt","links.txt","images.txt","all_listing_links.txt","opened_ad_urls.txt","all_image_urls.txt","live.log"}
-    if filename not in allowed:
-        return PlainTextResponse("File not allowed", status_code=400)
-    path = Path(job.debug_dir) / filename
-    if not path.exists():
+    root = Path(job.debug_dir).resolve()
+    path = (root / filename).resolve()
+    if not str(path).startswith(str(root)):
+        return PlainTextResponse("Invalid path", status_code=400)
+    if not path.exists() or not path.is_file():
         return PlainTextResponse("Debug file not created yet", status_code=404)
     return FileResponse(path)
+
+
+
+@app.post("/job/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse("Job not found", status_code=404)
+    job.cancel_requested = True
+    log_job(job, "Cancel requested from dashboard")
+    return RedirectResponse(url=f"/status/{job_id}", status_code=303)
+
+@app.post("/job/{job_id}/pause")
+async def pause_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse("Job not found", status_code=404)
+    job.pause_requested = True
+    log_job(job, "Pause requested from dashboard")
+    return RedirectResponse(url=f"/status/{job_id}", status_code=303)
+
+@app.post("/job/{job_id}/resume")
+async def resume_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse("Job not found", status_code=404)
+    job.pause_requested = False
+    log_job(job, "Resume requested from dashboard")
+    return RedirectResponse(url=f"/status/{job_id}", status_code=303)
 
 
 @app.get("/job/{job_id}.json")
@@ -1340,7 +1736,7 @@ async def job_json(job_id: str):
         "diagnostics": job.diagnostics,
         "results": safe_result_for_json(job.results),
         "logs": job.logs[-200:],
-        "debug_files": [p.name for p in Path(job.debug_dir).glob("*")] if job.debug_dir else [],
+        "debug_files": public_debug_files(job),
     })
 
 
@@ -1355,3 +1751,50 @@ async def scan_json(
 ):
     diag, results = await scan_site(mode, target_url, selected_city, max_links, max_images, screenshot_fallback)
     return JSONResponse({"diagnostics": diag.__dict__, "results": results})
+
+
+
+@app.get("/signs/{job_id}.zip")
+async def signs_zip(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse("Job not found", status_code=404)
+    root = Path(job.debug_dir)
+    zip_path = root / "confirmed_signs.zip"
+    with ZipFile(zip_path, "w", ZIP_DEFLATED) as zout:
+        wrote = False
+        for folder in ["signs"]:
+            d = root / folder
+            if d.exists():
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        zout.write(p, arcname=str(Path(folder) / p.name))
+                        wrote = True
+        if not wrote:
+            empty = root / "README_no_confirmed_signs_yet.txt"
+            empty.write_text("No confirmed signs have been saved for this job yet. Check candidates ZIP for possible signs and scanned samples.", encoding="utf-8")
+            zout.write(empty, arcname=empty.name)
+    return FileResponse(zip_path, filename=f"confirmed_signs_{job_id}.zip")
+
+
+@app.get("/candidates/{job_id}.zip")
+async def candidates_zip(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse("Job not found", status_code=404)
+    root = Path(job.debug_dir)
+    zip_path = root / "possible_and_confirmed_signs.zip"
+    with ZipFile(zip_path, "w", ZIP_DEFLATED) as zout:
+        wrote = False
+        for folder in ["signs", "possible_signs", "all_scanned_images"]:
+            d = root / folder
+            if d.exists():
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        zout.write(p, arcname=str(Path(folder) / p.name))
+                        wrote = True
+        if not wrote:
+            empty = root / "README_no_images_yet.txt"
+            empty.write_text("No scanned images have been saved for this job yet.", encoding="utf-8")
+            zout.write(empty, arcname=empty.name)
+    return FileResponse(zip_path, filename=f"possible_and_confirmed_signs_{job_id}.zip")
