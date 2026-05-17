@@ -58,3 +58,19 @@ Full-city scanning update:
 - In the web UI, set "Max listing/detail pages to open" to 0 to scan all ads discovered in the selected city/category.
 - Set "Max images to scan" to 0 to scan every usable image found.
 - The scanner now walks pagination/next pages and records city pagination pages visited plus listing/detail pages discovered in diagnostics.
+
+## Live scan/debug dashboard patch
+
+This version no longer blocks the browser while a full city scan runs. Press **Start scan** and the app creates a background job, then redirects to `/status/<job_id>`.
+
+Live pages/files:
+
+- `/status/<job_id>` - auto-refreshing progress dashboard
+- `/logs/<job_id>` - live text log
+- `/job/<job_id>.json` - machine-readable job status
+- `/debug/<job_id>/latest-page.jpg` - what Railway's browser saw on the latest city/listing page
+- `/debug/<job_id>/latest.html` - HTML Railway received
+- `/debug/<job_id>/all_listing_links.txt` - all listing/detail links discovered
+- `/debug/<job_id>/images.txt` - latest image URLs found
+
+Use these debug files if Leolist returns zero links or zero images. The screenshot/HTML will show whether Railway is blocked, redirected, or seeing a different page than Safari.
