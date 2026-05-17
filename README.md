@@ -49,3 +49,12 @@ Expected `/selftest`:
 ```json
 "ok": true
 ```
+
+
+Patched version: improved Leolist compatibility, anti-bot handling, JS loading, and lazy image extraction.
+
+Full-city scanning update:
+- The old default cap of 40 images has been removed.
+- In the web UI, set "Max listing/detail pages to open" to 0 to scan all ads discovered in the selected city/category.
+- Set "Max images to scan" to 0 to scan every usable image found.
+- The scanner now walks pagination/next pages and records city pagination pages visited plus listing/detail pages discovered in diagnostics.

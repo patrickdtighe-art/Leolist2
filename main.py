@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 import httpx
 from fastapi import FastAPI, Form
@@ -94,6 +94,8 @@ class Diagnostics:
     pages_scanned: int = 0
     candidate_links_found: int = 0
     pages_opened: int = 0
+    listing_pages_discovered: int = 0
+    pagination_pages_visited: int = 0
     images_found: int = 0
     images_scanned: int = 0
     screenshot_fallbacks_scanned: int = 0
@@ -215,7 +217,7 @@ async def dismiss_common_modals(page):
             pass
 
 
-async def extract_links(page, base_url: str, max_links: int) -> list[str]:
+async def extract_links(page, base_url: str, max_links: int | None = None) -> list[str]:
     raw = await page.evaluate(
         """() => {
             const out = [];
@@ -245,15 +247,16 @@ async def extract_links(page, base_url: str, max_links: int) -> list[str]:
             if likely_detail_link(href, base_url):
                 seen.add(href)
                 links.append(href)
-            if len(links) >= max_links:
+            if max_links and len(links) >= max_links:
                 return links
 
-    if len(links) < max_links:
+    if (not max_links) or len(links) < max_links:
         try:
             handles = await page.query_selector_all("article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad']")
             original = page.url
-            for h in handles[: max_links * 3]:
-                if len(links) >= max_links:
+            click_limit = (max_links * 3) if max_links else min(len(handles), 250)
+            for h in handles[:click_limit]:
+                if max_links and len(links) >= max_links:
                     break
                 try:
                     await h.click(timeout=1000)
@@ -271,7 +274,7 @@ async def extract_links(page, base_url: str, max_links: int) -> list[str]:
         except Exception:
             pass
 
-    return links[:max_links]
+    return links[:max_links] if max_links else links
 
 
 async def extract_image_urls(page, base_url: str) -> list[str]:
@@ -343,7 +346,31 @@ async def extract_image_urls(page, base_url: str) -> list[str]:
         if any(x in low for x in ["favicon", "sprite", "icon", "logo", "avatar-default"]):
             continue
         cleaned.append(u)
+    
+    # Extra Leolist-specific image harvesting
+    try:
+        extra_imgs = await page.eval_on_selector_all(
+            "img, a[href*='jpg'], a[href*='jpeg'], a[href*='png']",
+            """els => els.flatMap(el => {
+                const vals = [];
+                if (el.src) vals.push(el.src);
+                if (el.href) vals.push(el.href);
+                for (const a of ["data-src","data-full","data-original"]) {
+                    const v = el.getAttribute && el.getAttribute(a);
+                    if (v) vals.push(v);
+                }
+                return vals;
+            })"""
+        )
+
+        for v in extra_imgs:
+            if v and v.startswith("http"):
+                cleaned.append(v)
+    except Exception:
+        pass
+
     return list(dict.fromkeys(cleaned))
+
 
 
 async def fetch_image_bytes(url: str, referer: str) -> bytes | None:
@@ -416,12 +443,95 @@ def sign_key(verdict: dict[str, Any]) -> str:
     return hashlib.sha256((text + "|" + desc).encode()).hexdigest()
 
 
+
+def increment_url_page(url: str, page_num: int) -> str:
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key in ("page", "p"):
+        if key in q:
+            q[key] = str(page_num)
+            return urlunparse(parsed._replace(query=urlencode(q)))
+    sep = "&" if parsed.query else "?"
+    return url + f"{sep}page={page_num}"
+
+
+async def discover_city_listing_pages(context, start_url: str, max_links: int | None, max_city_pages: int = 250) -> tuple[list[str], int]:
+    """Walk a city/category page and common pagination links until no new ads are found."""
+    listing_links: list[str] = []
+    seen_listing_links: set[str] = set()
+    seen_city_pages: set[str] = set()
+    city_queue: list[str] = [start_url]
+    pagination_pages_visited = 0
+    empty_page_streak = 0
+
+    while city_queue and len(seen_city_pages) < max_city_pages:
+        city_url = city_queue.pop(0).split("#")[0]
+        if city_url in seen_city_pages:
+            continue
+        seen_city_pages.add(city_url)
+        pagination_pages_visited += 1
+
+        before_count = len(listing_links)
+        page = await context.new_page()
+        try:
+            await page.goto(city_url, wait_until="domcontentloaded", timeout=60000)
+            await dismiss_common_modals(page)
+            await page.wait_for_timeout(2500)
+            await auto_scroll(page, steps=24)
+
+            for link in await extract_links(page, city_url, None):
+                if link not in seen_listing_links and likely_detail_link(link, start_url):
+                    seen_listing_links.add(link)
+                    listing_links.append(link)
+                    if max_links and len(listing_links) >= max_links:
+                        await page.close()
+                        return listing_links, pagination_pages_visited
+
+            # Find explicit next/page-number links.
+            raw_next = await page.eval_on_selector_all(
+                "a[href]",
+                """els => els.map(a => ({href:a.href, text:(a.innerText||a.getAttribute('aria-label')||a.rel||'').trim().toLowerCase()}))"""
+            )
+            for item in raw_next:
+                href = (item.get("href") or "").split("#")[0]
+                text = item.get("text") or ""
+                if not href or not same_site(href, start_url) or href in seen_city_pages or href in city_queue:
+                    continue
+                low = href.lower()
+                looks_like_page = (
+                    "next" in text or "more" in text or text in {">", "›", "»"} or
+                    re.search(r"(^|\?|&)(page|p)=\d+", low) or
+                    re.search(r"/page/\d+", low)
+                )
+                if looks_like_page and not bad_link_path(urlparse(href).path.lower()):
+                    city_queue.append(href)
+        finally:
+            await page.close()
+
+        if len(listing_links) == before_count:
+            empty_page_streak += 1
+        else:
+            empty_page_streak = 0
+
+        # Also try ?page=N for sites that do not expose pagination links until later.
+        # Stop after several consecutive empty guessed pages so it does not crawl forever.
+        if len(seen_city_pages) < max_city_pages and empty_page_streak < 4:
+            next_guess = increment_url_page(start_url, len(seen_city_pages) + 1)
+            if next_guess not in seen_city_pages and next_guess not in city_queue:
+                city_queue.append(next_guess)
+
+        if empty_page_streak >= 4:
+            break
+
+    return listing_links, pagination_pages_visited
+
+
 async def scan_site(
     mode: str,
     target_url: str,
     selected_city: str,
-    max_links: int = 10,
-    max_images: int = 40,
+    max_links: int = 0,
+    max_images: int = 0,
     screenshot_fallback: bool = False,
 ) -> tuple[Diagnostics, list[dict[str, Any]]]:
     if mode == "leolist_city":
@@ -445,21 +555,30 @@ async def scan_site(
     seen_signs = set()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = await browser.new_context(
             viewport={"width": 1365, "height": 1800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
             ignore_https_errors=True,
+            locale="en-CA",
+            java_script_enabled=True,
         )
 
         start = await context.new_page()
         try:
-            await start.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-            await dismiss_common_modals(start)
-            await start.wait_for_timeout(2500)
-            await auto_scroll(start)
-            diag.pages_scanned += 1
-            links = await extract_links(start, target_url, max_links)
+            # Discover listing/detail pages across the entire selected city, including pagination.
+            # max_links=0 means no intentional listing cap; max_images=0 means no intentional image cap.
+            effective_max_links = max_links if max_links and max_links > 0 else None
+            links, pagination_count = await discover_city_listing_pages(context, target_url, effective_max_links)
+            diag.pagination_pages_visited = pagination_count
+            diag.pages_scanned += pagination_count
 
             if not links and "leolist" in target_url.lower():
                 parsed = urlparse(target_url)
@@ -469,11 +588,9 @@ async def scan_site(
                     parent_urls.append(parsed.scheme + "://" + parsed.netloc + "/" + "/".join(parts[:cut]))
                 for parent in parent_urls[:3]:
                     try:
-                        await start.goto(parent, wait_until="domcontentloaded", timeout=45000)
-                        await dismiss_common_modals(start)
-                        await start.wait_for_timeout(3000)
-                        await auto_scroll(start, steps=14)
-                        links = await extract_links(start, parent, max_links)
+                        links, pagination_count = await discover_city_listing_pages(context, parent, effective_max_links)
+                        diag.pagination_pages_visited += pagination_count
+                        diag.pages_scanned += pagination_count
                         if links:
                             target_url = parent
                             diag.target_url = parent
@@ -482,6 +599,7 @@ async def scan_site(
                         pass
 
             diag.candidate_links_found = len(links)
+            diag.listing_pages_discovered = len(links)
         except Exception as e:
             diag.extraction_errors.append(f"Could not open start URL: {e}")
             links = []
@@ -489,11 +607,12 @@ async def scan_site(
             await start.close()
 
         # scan start page too, but screenshot fallback remains off by default
-        pages = [target_url] + links[:max_links]
+        pages = [target_url] + links
         pages = list(dict.fromkeys(pages))
+        effective_max_images = max_images if max_images and max_images > 0 else None
 
         for link in pages:
-            if diag.images_scanned >= max_images:
+            if effective_max_images and diag.images_scanned >= effective_max_images:
                 break
 
             pg = await context.new_page()
@@ -509,7 +628,7 @@ async def scan_site(
                 scanned_on_page = 0
 
                 for img_url in urls:
-                    if diag.images_scanned >= max_images:
+                    if effective_max_images and diag.images_scanned >= effective_max_images:
                         break
                     data = await fetch_image_bytes(img_url, link)
                     if not data or len(data) < 3500:
@@ -540,7 +659,7 @@ async def scan_site(
                     except Exception as e:
                         diag.openai_api_errors.append(str(e)[:300])
 
-                if screenshot_fallback and scanned_on_page == 0 and diag.images_scanned < max_images:
+                if screenshot_fallback and scanned_on_page == 0 and (not effective_max_images or diag.images_scanned < effective_max_images):
                     # Off by default because it causes false positives from website UI.
                     try:
                         shot = await pg.screenshot(full_page=True, type="jpeg", quality=75)
@@ -621,7 +740,14 @@ async def selftest():
         </body></html>
         """
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
             report["playwright_browser_launch"] = True
             page = await browser.new_page()
             await page.set_content(html, wait_until="domcontentloaded")
@@ -703,10 +829,12 @@ window.addEventListener("DOMContentLoaded", updateMode);
 </div>
 
 <label>Max listing/detail pages to open</label>
-<input name="max_links" type="number" value="10" min="0" max="75">
+<input name="max_links" type="number" value="0" min="0" max="10000">
+<p class="small">Use 0 to scan the entire city/category instead of stopping at a fixed number of ads.</p>
 
 <label>Max images to scan</label>
-<input name="max_images" type="number" value="40" min="1" max="150">
+<input name="max_images" type="number" value="0" min="0" max="50000">
+<p class="small">Use 0 to scan every usable image found in the selected city/category.</p>
 
 <label>
 <input name="screenshot_fallback" type="checkbox" value="1" style="width:auto">
@@ -727,8 +855,8 @@ async def scan(
     mode: str = Form("leolist_city"),
     selected_city: str = Form("Northern Alberta / Grande Prairie"),
     target_url: str = Form(""),
-    max_links: int = Form(10),
-    max_images: int = Form(40),
+    max_links: int = Form(0),
+    max_images: int = Form(0),
     screenshot_fallback: str | None = Form(None),
 ):
     diag, results = await scan_site(
@@ -746,6 +874,8 @@ async def scan(
         ("Target URL", html_escape(diag.target_url)),
         ("Pages scanned", diag.pages_scanned),
         ("Candidate links found", diag.candidate_links_found),
+        ("City pagination pages visited", diag.pagination_pages_visited),
+        ("Listing/detail pages discovered", diag.listing_pages_discovered),
         ("Pages opened", diag.pages_opened),
         ("Images found", diag.images_found),
         ("Images scanned", diag.images_scanned),
@@ -809,8 +939,8 @@ async def scan_json(
     mode: str = "custom_url",
     target_url: str = "",
     selected_city: str = "Northern Alberta / Grande Prairie",
-    max_links: int = 10,
-    max_images: int = 40,
+    max_links: int = 0,
+    max_images: int = 0,
     screenshot_fallback: bool = False,
 ):
     diag, results = await scan_site(mode, target_url, selected_city, max_links, max_images, screenshot_fallback)
