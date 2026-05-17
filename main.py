@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
 from openai import AsyncOpenAI
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps, ImageFilter, ImageStat
 from playwright.async_api import async_playwright
 
 APP_TITLE = "Verification Sign Scanner"
@@ -29,6 +29,9 @@ SCAN_NAV_TIMEOUT_MS = int(os.getenv("SCAN_NAV_TIMEOUT_MS", "25000"))
 SCAN_STEP_TIMEOUT_SEC = int(os.getenv("SCAN_STEP_TIMEOUT_SEC", "90"))
 SCAN_MAX_CITY_PAGES = int(os.getenv("SCAN_MAX_CITY_PAGES", "80"))
 SCAN_MAX_EMPTY_PAGES = int(os.getenv("SCAN_MAX_EMPTY_PAGES", "4"))
+REVIEW_MODE_INCLUDE_ALL_AI_IMAGES = os.getenv("REVIEW_MODE_INCLUDE_ALL_AI_IMAGES", "1") == "1"
+HANDWRITING_MATCH_THRESHOLD = float(os.getenv("HANDWRITING_MATCH_THRESHOLD", "0.72"))
+HANDWRITING_POSSIBLE_THRESHOLD = float(os.getenv("HANDWRITING_POSSIBLE_THRESHOLD", "0.58"))
 
 LEOLIST_CITIES = {
     "Northern Alberta / Grande Prairie": "https://www.leolist.cc/personals/female-escorts/northern_alberta/grande_prairie",
@@ -59,29 +62,294 @@ LEOLIST_CITIES = {
 }
 
 VISION_PROMPT = """
-You are detecting physical verification signs in ad photos.
+You are reviewing ad photos for physical verification signs.
 
-Return sign_detected=true when the image contains a REAL PHYSICAL sign/note/card/paper/placard held by or placed beside a person.
-This includes handwritten notes, paper with username/date, cardboard signs, small cards, mirror-selfie notes, and partly cropped verification papers.
+A physical verification sign is any real-world paper, card, note, placard, poster, or written object intentionally shown to the camera by a person or placed near a person.
 
-Do NOT require the exact word "verification". If a person is holding any physical paper/card/sign that appears intentionally shown to the camera, count it.
+Be intentionally INCLUSIVE:
+- If you see a person holding a paper/card/note, set sign_detected=true.
+- If you are unsure but there might be a held paper/card/note, set possible_sign=true.
+- Do not require readable text.
+- Do not require the word verification.
+- Count mirror selfies, cropped images, small cards, handwritten notes, date/username papers, and partly visible papers.
 
-Return sign_detected=false for:
-- website UI text, captions, buttons, watermarks, overlays
-- tattoos or printed clothing
-- normal background posters not being intentionally shown
-- screenshots with no physical card/paper/sign
+Return false only when there is clearly no physical paper/card/sign-like object.
+
+Do NOT count website UI text, captions, menus, watermarks, tattoos, printed shirt logos, or ordinary background posters.
 
 Return JSON only:
 {
   "sign_detected": true or false,
   "possible_sign": true or false,
+  "needs_human_review": true or false,
   "sign_type": "paper_note/card/poster/label/placard/other/none",
   "text_visible": "readable text on the physical sign, otherwise empty",
   "description": "short description of any physical paper/card/sign-like object",
   "confidence": 0.0 to 1.0
 }
 """
+
+
+
+def _load_image_for_analysis(path: Path) -> Image.Image | None:
+    try:
+        return Image.open(path).convert("RGB")
+    except Exception:
+        return None
+
+def _image_to_ink_mask(img: Image.Image) -> tuple[Image.Image, dict[str, float]]:
+    """Convert a sign image into a rough handwriting/ink mask.
+
+    This is not forensic proof. It gives visual similarity features for review.
+    """
+    # Normalize size while keeping enough detail.
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((900, 900))
+    gray = ImageOps.grayscale(img)
+    gray = ImageOps.autocontrast(gray)
+    # Emphasize dark writing on light paper.
+    blurred = gray.filter(ImageFilter.GaussianBlur(radius=1.2))
+    # Use adaptive-ish threshold based on mean.
+    stat = ImageStat.Stat(blurred)
+    mean = stat.mean[0] if stat.mean else 180
+    threshold = max(70, min(190, mean * 0.78))
+    mask = blurred.point(lambda p: 255 if p < threshold else 0)
+    # Clean a bit.
+    mask = mask.filter(ImageFilter.MedianFilter(size=3))
+    w, h = mask.size
+    pixels = mask.load()
+    xs, ys = [], []
+    ink = 0
+    for y in range(h):
+        for x in range(w):
+            if pixels[x, y] > 0:
+                ink += 1
+                xs.append(x)
+                ys.append(y)
+    area = max(1, w * h)
+    stats = {
+        "ink_density": ink / area,
+        "width": float(w),
+        "height": float(h),
+    }
+    if xs and ys:
+        stats.update({
+            "bbox_x1": min(xs) / w,
+            "bbox_y1": min(ys) / h,
+            "bbox_x2": max(xs) / w,
+            "bbox_y2": max(ys) / h,
+            "bbox_w": (max(xs) - min(xs) + 1) / w,
+            "bbox_h": (max(ys) - min(ys) + 1) / h,
+        })
+    else:
+        stats.update({"bbox_x1":0, "bbox_y1":0, "bbox_x2":0, "bbox_y2":0, "bbox_w":0, "bbox_h":0})
+    return mask, stats
+
+def _projection_features(mask: Image.Image, bins: int = 24) -> list[float]:
+    w, h = mask.size
+    pix = mask.load()
+    feats = []
+    # vertical projection
+    for i in range(bins):
+        x1 = int(i * w / bins)
+        x2 = int((i + 1) * w / bins)
+        total = max(1, (x2 - x1) * h)
+        ink = 0
+        for y in range(h):
+            for x in range(x1, x2):
+                if pix[x, y] > 0:
+                    ink += 1
+        feats.append(ink / total)
+    # horizontal projection
+    for i in range(bins):
+        y1 = int(i * h / bins)
+        y2 = int((i + 1) * h / bins)
+        total = max(1, (y2 - y1) * w)
+        ink = 0
+        for y in range(y1, y2):
+            for x in range(w):
+                if pix[x, y] > 0:
+                    ink += 1
+        feats.append(ink / total)
+    return feats
+
+def _zone_density_features(mask: Image.Image, grid: int = 8) -> list[float]:
+    w, h = mask.size
+    pix = mask.load()
+    feats = []
+    for gy in range(grid):
+        y1 = int(gy * h / grid)
+        y2 = int((gy + 1) * h / grid)
+        for gx in range(grid):
+            x1 = int(gx * w / grid)
+            x2 = int((gx + 1) * w / grid)
+            total = max(1, (x2 - x1) * (y2 - y1))
+            ink = 0
+            for y in range(y1, y2):
+                for x in range(x1, x2):
+                    if pix[x, y] > 0:
+                        ink += 1
+            feats.append(ink / total)
+    return feats
+
+def _stroke_orientation_features(mask: Image.Image) -> list[float]:
+    # Simple directional edge histogram.
+    small = mask.resize((180, 180))
+    edges = small.filter(ImageFilter.FIND_EDGES)
+    pix = edges.load()
+    w, h = edges.size
+    buckets = [0.0] * 8
+    for y in range(1, h - 1, 2):
+        for x in range(1, w - 1, 2):
+            c = pix[x, y]
+            if c < 20:
+                continue
+            gx = pix[x + 1, y] - pix[x - 1, y]
+            gy = pix[x, y + 1] - pix[x, y - 1]
+            if gx == 0 and gy == 0:
+                continue
+            import math
+            angle = (math.atan2(gy, gx) + math.pi) / (2 * math.pi)
+            bi = min(7, int(angle * 8))
+            buckets[bi] += c / 255.0
+    total = sum(buckets) or 1.0
+    return [b / total for b in buckets]
+
+def handwriting_feature_vector(image_path: Path) -> dict[str, Any] | None:
+    img = _load_image_for_analysis(image_path)
+    if img is None:
+        return None
+    mask, stats = _image_to_ink_mask(img)
+    feats = []
+    feats.extend(_projection_features(mask, bins=24))
+    feats.extend(_zone_density_features(mask, grid=8))
+    feats.extend(_stroke_orientation_features(mask))
+    feats.extend([
+        stats["ink_density"],
+        stats["bbox_w"],
+        stats["bbox_h"],
+        stats["bbox_x1"],
+        stats["bbox_y1"],
+        stats["bbox_x2"],
+        stats["bbox_y2"],
+    ])
+    # Normalize vector.
+    import math
+    norm = math.sqrt(sum(float(x) * float(x) for x in feats)) or 1.0
+    vec = [float(x) / norm for x in feats]
+    return {
+        "path": str(image_path),
+        "filename": image_path.name,
+        "features": vec,
+        "stats": stats,
+    }
+
+def handwriting_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    va = a.get("features") or []
+    vb = b.get("features") or []
+    if not va or not vb or len(va) != len(vb):
+        return 0.0
+    dot = sum(float(x) * float(y) for x, y in zip(va, vb))
+    # Cosine similarity already roughly 0..1 for nonnegative features.
+    return max(0.0, min(1.0, dot))
+
+def handwriting_label(score: float) -> str:
+    if score >= HANDWRITING_MATCH_THRESHOLD:
+        return "high visual handwriting similarity"
+    if score >= HANDWRITING_POSSIBLE_THRESHOLD:
+        return "possible handwriting similarity"
+    return "different / low similarity"
+
+def collect_handwriting_source_images(job) -> list[Path]:
+    root = Path(job.debug_dir)
+    folders = ["signs", "possible_signs", "rendered_gallery_captures", "all_scanned_images"]
+    paths: list[Path] = []
+    seen = set()
+    for folder in folders:
+        d = root / folder
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.jpg")):
+            # Prefer likely sign/review folders but include samples so zero-confirmed scans can still be analyzed.
+            key = p.read_bytes()[:64] if p.exists() else str(p)
+            ident = hashlib.sha256((str(p.stat().st_size) + str(key)).encode(errors="ignore")).hexdigest()
+            if ident in seen:
+                continue
+            seen.add(ident)
+            paths.append(p)
+            if len(paths) >= 500:
+                return paths
+    return paths
+
+def build_handwriting_report(job) -> dict[str, Any]:
+    paths = collect_handwriting_source_images(job)
+    items = []
+    for p in paths:
+        fv = handwriting_feature_vector(p)
+        if fv:
+            rel = str(p.relative_to(Path(job.debug_dir)))
+            fv["relative_path"] = rel
+            fv["url"] = f"/debug/{job.id}/{rel}"
+            items.append(fv)
+
+    pairs = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            score = handwriting_similarity(items[i], items[j])
+            if score >= HANDWRITING_POSSIBLE_THRESHOLD:
+                pairs.append({
+                    "a": items[i]["relative_path"],
+                    "b": items[j]["relative_path"],
+                    "a_url": items[i]["url"],
+                    "b_url": items[j]["url"],
+                    "score": round(score, 4),
+                    "label": handwriting_label(score),
+                })
+    pairs.sort(key=lambda x: x["score"], reverse=True)
+
+    # Union-find clusters for high/possible similarity.
+    parent = list(range(len(items)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    index = {it["relative_path"]: n for n, it in enumerate(items)}
+    for p in pairs:
+        if p["score"] >= HANDWRITING_POSSIBLE_THRESHOLD:
+            union(index[p["a"]], index[p["b"]])
+    clusters_map: dict[int, list[dict[str, Any]]] = {}
+    for n, it in enumerate(items):
+        clusters_map.setdefault(find(n), []).append({
+            "relative_path": it["relative_path"],
+            "url": it["url"],
+            "stats": it["stats"],
+        })
+    clusters = [v for v in clusters_map.values() if len(v) >= 2]
+    clusters.sort(key=len, reverse=True)
+
+    report = {
+        "job_id": job.id,
+        "warning": "Handwriting similarity is probabilistic visual matching for review only, not forensic identification.",
+        "threshold_high": HANDWRITING_MATCH_THRESHOLD,
+        "threshold_possible": HANDWRITING_POSSIBLE_THRESHOLD,
+        "image_count": len(items),
+        "pair_count": len(pairs),
+        "clusters": clusters,
+        "pairs": pairs[:300],
+    }
+
+    try:
+        root = Path(job.debug_dir)
+        (root / "handwriting_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return report
 
 
 def safe_write_jsonl(path: Path, obj: dict):
@@ -662,6 +930,89 @@ async def expand_ad_gallery_and_collect_images(page, base_url: str, job: ScanJob
 
     return list(dict.fromkeys(collected))
 
+
+async def save_full_ad_screenshot_review(pg, job: ScanJob | None, page_url: str, reason: str):
+    """Always keep visual proof of opened ads so zero-result scans can be inspected."""
+    if not job:
+        return
+    try:
+        root = Path(job.debug_dir)
+        d = root / "opened_ad_screenshots"
+        d.mkdir(parents=True, exist_ok=True)
+        n = len(list(d.glob("ad_*.jpg"))) + 1
+        data = await pg.screenshot(full_page=True, type="jpeg", quality=70)
+        (d / f"ad_{n:04d}.jpg").write_bytes(data)
+        (d / f"ad_{n:04d}.json").write_text(json.dumps({"page_url": page_url, "reason": reason}, indent=2), encoding="utf-8")
+    except Exception as e:
+        log_job(job, f"Could not save opened ad screenshot: {e}")
+
+
+
+async def collect_rendered_photo_screenshots(page, job: ScanJob | None, page_url: str) -> list[tuple[str, bytes]]:
+    """Capture rendered photo/gallery elements as screenshots.
+
+    This helps when direct image URLs are blocked or show question-mark placeholders.
+    """
+    captures: list[tuple[str, bytes]] = []
+    selectors = [
+        "img",
+        "picture",
+        "[class*='gallery']",
+        "[class*='photo']",
+        "[class*='image']",
+        "[class*='carousel']",
+        "[class*='slider']",
+        "[style*='background-image']",
+    ]
+    seen_boxes = set()
+    for sel in selectors:
+        try:
+            els = await page.query_selector_all(sel)
+        except Exception:
+            continue
+        for idx, el in enumerate(els[:80]):
+            try:
+                box = await el.bounding_box()
+                if not box:
+                    continue
+                w = float(box.get("width") or 0)
+                h = float(box.get("height") or 0)
+                x = int(box.get("x") or 0)
+                y = int(box.get("y") or 0)
+                key = (round(x / 20), round(y / 20), round(w / 20), round(h / 20))
+                if key in seen_boxes:
+                    continue
+                seen_boxes.add(key)
+                if w < 140 or h < 140 or w * h < 30000:
+                    continue
+                await el.scroll_into_view_if_needed(timeout=1500)
+                await page.wait_for_timeout(250)
+                data = await el.screenshot(type="jpeg", quality=82, timeout=5000)
+                if data and len(data) > 4000:
+                    label = f"rendered:{sel}:{idx}:{page_url}"
+                    captures.append((label, data))
+                    if job:
+                        try:
+                            root = Path(job.debug_dir)
+                            d = root / "rendered_gallery_captures"
+                            d.mkdir(parents=True, exist_ok=True)
+                            n = len(list(d.glob("rendered_*.jpg"))) + 1
+                            (d / f"rendered_{n:04d}.jpg").write_bytes(data)
+                            (d / f"rendered_{n:04d}.json").write_text(json.dumps({
+                                "page_url": page_url,
+                                "selector": sel,
+                                "box": box,
+                                "label": label,
+                            }, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+                if len(captures) >= 40:
+                    return captures
+            except Exception:
+                pass
+    return captures
+
+
 async def fetch_image_bytes(url: str, referer: str) -> bytes | None:
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -775,7 +1126,10 @@ async def analyze_image(client: AsyncOpenAI, data: bytes) -> dict[str, Any]:
         response_format={"type": "json_object"},
         temperature=0,
     )
-    return json.loads(resp.choices[0].message.content or "{}")
+    verdict = json.loads(resp.choices[0].message.content or "{}")
+    if verdict.get("sign_detected") or verdict.get("possible_sign"):
+        verdict["needs_human_review"] = True
+    return verdict
 
 
 def sign_key(verdict: dict[str, Any]) -> str:
@@ -1082,6 +1436,7 @@ async def scan_site(
                 diag.pages_opened += 1
 
                 try:
+                    await save_full_ad_screenshot_review(pg, job, link, "opened individual ad")
                     write_debug_text(job, "latest_ad_url.txt", link)
                     write_debug_text(job, "latest_ad.html", await pg.content())
                     write_debug_bytes(job, "latest-ad-page.jpg", await pg.screenshot(full_page=True, type="jpeg", quality=70))
@@ -1092,6 +1447,16 @@ async def scan_site(
                 all_image_urls.extend([u for u in urls if u not in all_image_urls])
                 write_debug_text(job, "images.txt", "\n".join(urls))
                 write_debug_text(job, "all_image_urls.txt", "\n".join(all_image_urls))
+                rendered_captures = await collect_rendered_photo_screenshots(pg, job, link)
+                if rendered_captures:
+                    log_job(job, f"Rendered gallery screenshots captured from ad: {len(rendered_captures)}")
+                    for rendered_label, rendered_data in rendered_captures:
+                        if rendered_label not in urls:
+                            urls.append(rendered_label)
+                    rendered_bytes_by_url = {label: data for label, data in rendered_captures}
+                else:
+                    rendered_bytes_by_url = {}
+
                 diag.images_found += len(urls)
                 diag.all_image_urls_written = len(all_image_urls)
                 diag.ads_opened = diag.pages_opened
@@ -1100,11 +1465,13 @@ async def scan_site(
                 for img_url in urls:
                     if effective_max_images and diag.images_scanned >= effective_max_images:
                         break
-                    data = await fetch_image_bytes(img_url, link)
+                    data = rendered_bytes_by_url.get(img_url)
+                    if not data:
+                        data = await fetch_image_bytes(img_url, link)
                     if not data or len(data) < 3500:
                         data = await image_bytes_from_page_element(pg, img_url, job)
                     if not data or len(data) < 2500:
-                        log_job(job, f"Skipped unusable image: {img_url}")
+                        log_job(job, f"Skipped unusable image or placeholder: {img_url}")
                         continue
                     fp = image_fingerprint(data)
                     if fp in seen_images:
@@ -1143,10 +1510,17 @@ async def scan_site(
 
                         # Lowered from 0.55 to 0.35 so possible verification cards are not missed.
                         # Duplicate filtering still prevents repeated signs from filling results.
-                        if verdict.get("possible_sign") or verdict.get("sign_detected") or float(verdict.get("confidence", 0) or 0) >= 0.20:
+                        conf = float(verdict.get("confidence", 0) or 0)
+                        reviewable = verdict.get("sign_detected") or verdict.get("possible_sign") or verdict.get("needs_human_review") or conf >= 0.05 or REVIEW_MODE_INCLUDE_ALL_AI_IMAGES
+                        confirmed = verdict.get("sign_detected") or verdict.get("possible_sign") or verdict.get("needs_human_review") or conf >= 0.20
+
+                        if reviewable:
                             save_candidate_image(job, data, verdict, link, img_url, "possible_signs")
-                        if (verdict.get("sign_detected") or verdict.get("possible_sign")) and float(verdict.get("confidence", 0) or 0) >= 0.20:
+
+                        if confirmed:
                             key = sign_key(verdict)
+                            if key == hashlib.sha256(("|").encode()).hexdigest():
+                                key = fp
                             if key in seen_signs:
                                 diag.duplicate_signs_skipped += 1
                                 continue
@@ -1156,6 +1530,7 @@ async def scan_site(
                                 "image_url": img_url,
                                 "preview": to_data_url(data),
                                 "verdict": verdict,
+                                "review_label": "confirmed_or_review",
                             }
                             results.append(result)
                             save_candidate_image(job, data, verdict, link, img_url, "signs")
@@ -1489,6 +1864,14 @@ async def run_scan_job(job: ScanJob):
         )
         job.diagnostics = diag.__dict__
         job.results = results
+        try:
+            hw = build_handwriting_report(job)
+            job.diagnostics["handwriting_images_compared"] = hw.get("image_count", 0)
+            job.diagnostics["handwriting_possible_pairs"] = hw.get("pair_count", 0)
+            job.diagnostics["handwriting_clusters"] = len(hw.get("clusters", []))
+            log_job(job, f"Handwriting comparison complete: {hw.get('pair_count', 0)} possible pair(s), {len(hw.get('clusters', []))} cluster(s)")
+        except Exception as hw_e:
+            log_job(job, f"Handwriting comparison failed: {hw_e}")
         job.status = "done"
         log_job(job, f"Finished: {len(results)} unique verification sign(s) found")
     except Exception as e:
@@ -1515,6 +1898,8 @@ def render_results_html(job: ScanJob) -> str:
     possible_count = count_files(job, "possible_signs")
     scanned_samples = count_files(job, "all_scanned_images")
     confirmed_count = count_files(job, "signs")
+    handwriting_pairs = safe_int(diag.get("handwriting_possible_pairs", 0))
+    handwriting_clusters = safe_int(diag.get("handwriting_clusters", 0))
     openai_calls = safe_int(diag.get("openai_vision_calls", 0))
     dup_imgs = safe_int(diag.get("duplicate_images_skipped_before_ai", 0))
     dup_signs = safe_int(diag.get("duplicate_signs_skipped", 0))
@@ -1612,6 +1997,8 @@ def render_results_html(job: ScanJob) -> str:
       <a class="btn primary" href="/job/{job.id}.json">Job JSON</a>
       <a class="btn" href="/logs/{job.id}">Live logs</a>
       <a class="btn" href="/signs/{job.id}.zip">Confirmed signs ZIP</a>
+      <a class="btn" href="/review/{job.id}">Review images</a>
+      <a class="btn" href="/handwriting/{job.id}">Handwriting matches</a>
       <a class="btn" href="/candidates/{job.id}.zip">Possible signs + scanned images ZIP</a>
       <a class="btn" href="/debug/{job.id}/latest-page.jpg">Latest city screenshot</a>
       <a class="btn" href="/debug/{job.id}/latest-ad-page.jpg">Latest ad screenshot</a>
@@ -1630,6 +2017,7 @@ def render_results_html(job: ScanJob) -> str:
     {stat("Pages scanned", pages_scanned, f"{pages_total} discovered/expected")}
     {stat("Scanned samples", scanned_samples, "saved for proof")}
     {stat("Duplicate signs", dup_signs, "ignored")}
+    {stat("Writing matches", handwriting_pairs, f"{handwriting_clusters} cluster(s)")}
     {stat("Mode", html_escape(job.mode), "")}
     {stat("Max limits", f"{job.max_links or 'all'} ads / {job.max_images or 'all'} imgs", "")}
   </section>
@@ -1723,6 +2111,128 @@ async def resume_job(job_id: str):
     return RedirectResponse(url=f"/status/{job_id}", status_code=303)
 
 
+
+@app.get("/review/{job_id}", response_class=HTMLResponse)
+async def review_page(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return HTMLResponse("Job not found", status_code=404)
+    root = Path(job.debug_dir)
+    cards = ""
+    for folder, title in [("signs", "Confirmed / review hits"), ("possible_signs", "Possible signs"), ("all_scanned_images", "All scanned samples"), ("opened_ad_screenshots", "Opened ad screenshots"), ("rendered_gallery_captures", "Rendered gallery captures")]:
+        d = root / folder
+        if not d.exists():
+            continue
+        imgs = sorted([p for p in d.glob("*.jpg")])[:300]
+        if not imgs:
+            continue
+        cards += f"<h2>{html_escape(title)} ({len(imgs)})</h2><div class='grid'>"
+        for p in imgs:
+            meta = p.with_suffix(".json")
+            text = ""
+            if meta.exists():
+                try:
+                    text = html_escape(meta.read_text(encoding="utf-8", errors="ignore")[:1000])
+                except Exception:
+                    text = ""
+            cards += f"""
+            <div class='card'>
+              <img src='/debug/{job.id}/{folder}/{p.name}'>
+              <pre>{text}</pre>
+            </div>
+            """
+        cards += "</div>"
+    if not cards:
+        cards = "<p>No review images saved yet. Wait until images are scanned, then refresh.</p>"
+    return f"""
+<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Review images</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#080b12;color:#eef4ff;margin:0;padding:18px}}
+a{{color:#66e3ff}} .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}}
+.card{{background:#101621;border:1px solid #243145;border-radius:16px;padding:10px}}
+img{{width:100%;border-radius:12px;background:#000}} pre{{white-space:pre-wrap;font-size:11px;color:#cbd5e1;max-height:180px;overflow:auto}}
+</style></head><body>
+<p><a href='/status/{job.id}'>Back to dashboard</a> | <a href='/candidates/{job.id}.zip'>Download review ZIP</a></p>
+<h1>Review images for job {html_escape(job.id)}</h1>
+{cards}
+</body></html>"""
+
+
+
+@app.get("/handwriting/{job_id}", response_class=HTMLResponse)
+async def handwriting_page(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return HTMLResponse("Job not found", status_code=404)
+    report_path = Path(job.debug_dir) / "handwriting_report.json"
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            report = build_handwriting_report(job)
+    else:
+        report = build_handwriting_report(job)
+
+    pairs = report.get("pairs", [])
+    clusters = report.get("clusters", [])
+
+    pair_html = ""
+    for p in pairs[:100]:
+        pair_html += f"""
+        <div class="pair">
+          <div><img src="{html_escape(p.get('a_url',''))}"><small>{html_escape(p.get('a',''))}</small></div>
+          <div><img src="{html_escape(p.get('b_url',''))}"><small>{html_escape(p.get('b',''))}</small></div>
+          <div class="score"><b>{int(float(p.get('score',0))*100)}%</b><span>{html_escape(p.get('label',''))}</span></div>
+        </div>
+        """
+    if not pair_html:
+        pair_html = "<p>No handwriting-similar pairs found yet. This may mean no sign/review images were captured, or the samples are too visually different.</p>"
+
+    cluster_html = ""
+    for ci, cluster in enumerate(clusters[:50], 1):
+        imgs = "".join(f"<img src='{html_escape(item.get('url',''))}'><small>{html_escape(item.get('relative_path',''))}</small>" for item in cluster[:12])
+        cluster_html += f"<section class='cluster'><h3>Cluster {ci}: {len(cluster)} image(s)</h3><div class='thumbs'>{imgs}</div></section>"
+    if not cluster_html:
+        cluster_html = "<p>No clusters yet.</p>"
+
+    return f"""
+<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handwriting matches</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#080b12;color:#eef4ff;margin:0;padding:18px}}
+a{{color:#66e3ff}} .warn{{background:#2a1d0a;border:1px solid #ffca57;border-radius:14px;padding:12px;color:#ffe0a0}}
+.grid{{display:grid;grid-template-columns:1fr;gap:14px}} .pair{{display:grid;grid-template-columns:1fr 1fr 160px;gap:12px;background:#101621;border:1px solid #243145;border-radius:16px;padding:12px;margin:12px 0;align-items:center}}
+img{{width:100%;max-height:280px;object-fit:contain;background:#000;border-radius:12px}} small{{display:block;color:#9ca8ba;word-break:break-all;margin-top:6px}}
+.score{{text-align:center}} .score b{{font-size:34px;color:#66e3ff;display:block}} .score span{{color:#cbd5e1}}
+.cluster{{background:#101621;border:1px solid #243145;border-radius:16px;padding:12px;margin:12px 0}} .thumbs{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}}
+.card{{background:#101621;border:1px solid #243145;border-radius:16px;padding:14px;margin:12px 0}}
+@media(max-width:760px){{.pair{{grid-template-columns:1fr}}}}
+</style></head><body>
+<p><a href="/status/{job.id}">Back to dashboard</a> | <a href="/debug/{job.id}/handwriting_report.json">Download JSON report</a></p>
+<h1>Handwriting similarity review</h1>
+<div class="warn"><b>Important:</b> This is probabilistic visual matching for review only. It cannot prove the same person wrote two signs. Treat high scores as leads that need human review.</div>
+<div class="card">
+  <p><b>Images compared:</b> {report.get('image_count',0)}</p>
+  <p><b>Possible/high-similarity pairs:</b> {report.get('pair_count',0)}</p>
+  <p><b>Clusters:</b> {len(clusters)}</p>
+  <p><b>High threshold:</b> {report.get('threshold_high')} · <b>Possible threshold:</b> {report.get('threshold_possible')}</p>
+</div>
+<h2>Clusters</h2>
+{cluster_html}
+<h2>Top similar pairs</h2>
+<div class="grid">{pair_html}</div>
+</body></html>
+"""
+
+@app.get("/handwriting/{job_id}.json")
+async def handwriting_json(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return JSONResponse(build_handwriting_report(job))
+
+
 @app.get("/job/{job_id}.json")
 async def job_json(job_id: str):
     job = get_job(job_id)
@@ -1786,7 +2296,7 @@ async def candidates_zip(job_id: str):
     zip_path = root / "possible_and_confirmed_signs.zip"
     with ZipFile(zip_path, "w", ZIP_DEFLATED) as zout:
         wrote = False
-        for folder in ["signs", "possible_signs", "all_scanned_images"]:
+        for folder in ["signs", "possible_signs", "all_scanned_images", "opened_ad_screenshots", "rendered_gallery_captures"]:
             d = root / folder
             if d.exists():
                 for p in d.rglob("*"):

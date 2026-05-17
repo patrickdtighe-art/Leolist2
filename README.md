@@ -172,3 +172,49 @@ Do NOT use:
 uvicorn main:app --host 0.0.0.0 --port $PORT
 
 because Railway may pass $PORT literally unless it runs through a shell.
+
+VISIBLE REVIEW MODE BUILD
+=========================
+This build changes zero-result behavior.
+
+Instead of only showing "0 signs", it now:
+- saves every opened ad screenshot in opened_ad_screenshots/
+- saves all scanned image samples in all_scanned_images/
+- saves possible/review images in possible_signs/
+- adds /review/<job_id> to visually inspect what the app actually scanned
+- includes opened ad screenshots in the candidates ZIP
+- uses a more inclusive physical verification signs prompt
+- treats possible_sign / needs_human_review as visible review hits
+
+How to diagnose:
+1. Start a scan.
+2. Open the dashboard.
+3. Click "Review images".
+4. If sign photos appear there, the app is scanning correctly.
+5. If sign photos do not appear there, the crawler is not reaching/extracting those ad gallery images from Railway.
+
+
+HANDWRITING SIMILARITY BUILD
+============================
+Added:
+- Rendered gallery fallback for Leolist/question-mark image issues.
+- Review images page.
+- Handwriting similarity comparison.
+- Automatic handwriting report after each scan.
+- /handwriting/<job_id> visual match dashboard.
+- /handwriting/<job_id>.json and /debug/<job_id>/handwriting_report.json report download.
+- Clusters likely similar handwriting.
+- Pairwise side-by-side comparisons.
+
+Important:
+Handwriting matching is probabilistic visual similarity, not forensic proof.
+Use it as a lead/review tool only.
+
+Railway variables:
+OPENAI_API_KEY=your key
+Optional:
+HANDWRITING_MATCH_THRESHOLD=0.72
+HANDWRITING_POSSIBLE_THRESHOLD=0.58
+REVIEW_MODE_INCLUDE_ALL_AI_IMAGES=1
+SCAN_NAV_TIMEOUT_MS=25000
+SCAN_MAX_CITY_PAGES=80
