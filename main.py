@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import hashlib
@@ -5,336 +6,603 @@ import io
 import json
 import os
 import re
-import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from PIL import Image
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
-APP_NAME = "Leolist Sign Scanner"
+APP_TITLE = "Any Website Sign Scanner"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_LISTINGS_DEFAULT = int(os.getenv("MAX_LISTINGS", "15"))
-MAX_IMAGES_PER_LISTING = int(os.getenv("MAX_IMAGES_PER_LISTING", "30"))
-MAX_AI_CALLS = int(os.getenv("MAX_AI_CALLS", "120"))
-RESULT_DIR = "static/results"
-BASE_URL = "https://www.leolist.cc"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-app = FastAPI(title=APP_NAME)
-os.makedirs(RESULT_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+VISION_PROMPT = """
+Detect ANY visible sign or intentionally displayed text in this image.
 
-CITY_URLS = {
-    "Northern Alberta / Grande Prairie": "https://www.leolist.cc/personals/female-escorts/northern_alberta/grande_prairie",
-    "Northern Alberta / Fort McMurray": "https://www.leolist.cc/personals/female-escorts/northern_alberta/fort_mcmurray",
-    "Edmonton": "https://www.leolist.cc/personals/female-escorts/edmonton",
-    "Calgary": "https://www.leolist.cc/personals/female-escorts/calgary",
-    "Vancouver": "https://www.leolist.cc/personals/female-escorts/vancouver",
-    "Toronto": "https://www.leolist.cc/personals/female-escorts/toronto",
-    "Winnipeg": "https://www.leolist.cc/personals/female-escorts/winnipeg",
-    "Saskatoon": "https://www.leolist.cc/personals/female-escorts/saskatoon",
-    "Regina": "https://www.leolist.cc/personals/female-escorts/regina",
-    "Ottawa": "https://www.leolist.cc/personals/female-escorts/ottawa",
-    "Montreal": "https://www.leolist.cc/personals/female-escorts/montreal",
-    "Halifax": "https://www.leolist.cc/personals/female-escorts/halifax",
+A sign can be:
+- paper, card, note, poster, board, placard, label, sticker
+- handwritten or printed text
+- username/date/verification sign
+- text on a wall, mirror, object, screen, package, ad image, or background
+- any readable displayed message
+
+The sign does NOT need to be held by a person.
+
+Return JSON only:
+{
+  "sign_detected": true or false,
+  "sign_type": "paper/card/poster/label/screen/wall/object/other",
+  "text_visible": "readable text if any, otherwise empty",
+  "description": "short description",
+  "confidence": 0.0 to 1.0
 }
+"""
+
+app = FastAPI(title=APP_TITLE)
+
 
 @dataclass
-class FoundSign:
-    image_url: str
-    saved_path: str
-    listing_url: str
-    text_visible: str
-    sign_type: str
-    description: str
-    confidence: str
-    hash: str
+class Diagnostics:
+    target_url: str = ""
+    pages_scanned: int = 0
+    candidate_links_found: int = 0
+    listings_opened: int = 0
+    images_found: int = 0
+    images_scanned: int = 0
+    screenshot_fallbacks_scanned: int = 0
+    openai_vision_calls: int = 0
+    openai_api_errors: list[str] = field(default_factory=list)
+    extraction_errors: list[str] = field(default_factory=list)
+    duplicate_images_skipped_before_ai: int = 0
+    duplicate_signs_skipped: int = 0
+    signs_found: int = 0
+    likely_problem: str = ""
 
 
-def now_id() -> str:
-    return str(int(time.time() * 1000))
+def html_escape(s: Any) -> str:
+    import html
+    return html.escape(str(s or ""))
 
 
-def normalize_url(url: str, base: str) -> str | None:
+def normalize_url(url: str) -> str:
+    url = (url or "").strip()
     if not url:
-        return None
-    url = url.strip().strip('"\'')
-    if url.startswith("data:") or url.startswith("blob:"):
-        return None
-    if url.startswith("//"):
-        url = "https:" + url
-    if url.startswith("/"):
-        url = urljoin(base, url)
-    if not url.startswith("http"):
-        return None
-    low = url.lower()
-    if any(x in low for x in ["logo", "sprite", "avatar-placeholder", "placeholder", "google", "doubleclick"]):
-        return None
-    if any(low.endswith(ext) for ext in [".svg", ".gif"]):
-        return None
+        return ""
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
     return url
 
 
-async def safe_goto(page, url: str):
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+def same_site(url: str, base: str) -> bool:
     try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
+        return urlparse(url).netloc.replace("www.", "") == urlparse(base).netloc.replace("www.", "")
     except Exception:
-        pass
+        return False
 
 
-async def auto_scroll(page, rounds: int = 6):
-    for _ in range(rounds):
+def looks_like_asset(url: str) -> bool:
+    return bool(re.search(r"\.(jpg|jpeg|png|webp|gif|avif)(\?|$)", url, re.I))
+
+
+def likely_listing_link(url: str, base: str) -> bool:
+    if not same_site(url, base):
+        return False
+    p = urlparse(url).path.lower()
+    if not p or p in ["/", ""]:
+        return False
+    bad = ["login", "signup", "register", "privacy", "terms", "contact", "help", "faq", "about", "javascript:"]
+    if any(x in p for x in bad):
+        return False
+    return True
+
+
+async def auto_scroll(page, steps: int = 5):
+    for _ in range(steps):
         await page.mouse.wheel(0, 1600)
         await page.wait_for_timeout(700)
 
 
-async def collect_listing_links(page, city_url: str, max_listings: int) -> list[str]:
-    await safe_goto(page, city_url)
-    await auto_scroll(page, 5)
-    hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(a => a.href)")
-    links: list[str] = []
+async def extract_links(page, base_url: str, max_links: int) -> list[str]:
+    raw = await page.eval_on_selector_all(
+        "a[href]",
+        """els => els.map(a => a.href).filter(Boolean)"""
+    )
+    links = []
     seen = set()
-    for href in hrefs:
-        if not href:
+    for href in raw:
+        href = urljoin(base_url, href)
+        href = href.split("#")[0]
+        if href in seen:
             continue
-        h = href.split("#")[0]
-        low = h.lower()
-        # Broad enough for Leolist ad pages, narrow enough to avoid menus/categories.
-        looks_like_ad = any(x in low for x in ["/ad/", "classified", "posting", "escorts/"]) and h != city_url
-        if looks_like_ad and h.startswith("http") and h not in seen:
-            seen.add(h)
-            links.append(h)
-        if len(links) >= max_listings:
+        if likely_listing_link(href, base_url):
+            seen.add(href)
+            links.append(href)
+        if len(links) >= max_links:
             break
-    if not links:
-        # Fallback: use same-domain links deeper than category page.
-        parsed = urlparse(city_url)
-        for href in hrefs:
-            if href and urlparse(href).netloc == parsed.netloc and href.rstrip("/") != city_url.rstrip("/") and href not in seen:
-                seen.add(href)
-                links.append(href)
-            if len(links) >= max_listings:
-                break
-    return links[:max_listings]
+    return links
 
 
-async def extract_images(page, base_url: str) -> list[str]:
+async def extract_image_urls(page, base_url: str) -> list[str]:
     urls = set()
-    await page.wait_for_timeout(2500)
-    await auto_scroll(page, 4)
 
-    js = """
-    () => {
-      const out = [];
-      const attrs = ['src','data-src','data-lazy-src','data-original','data-url','data-full','data-image','href','srcset'];
-      for (const el of document.querySelectorAll('*')) {
-        for (const a of attrs) {
-          const v = el.getAttribute && el.getAttribute(a);
-          if (v) out.push(v);
-        }
-        const st = window.getComputedStyle(el);
-        if (st && st.backgroundImage && st.backgroundImage !== 'none') out.push(st.backgroundImage);
-        const inline = el.getAttribute && el.getAttribute('style');
-        if (inline) out.push(inline);
-      }
-      return out;
+    # img attributes and srcset
+    img_data = await page.eval_on_selector_all(
+        "img",
+        """imgs => imgs.flatMap(img => {
+            const vals = [];
+            for (const a of ["src","data-src","data-lazy-src","data-original","data-url"]) {
+                const v = img.getAttribute(a);
+                if (v) vals.push(v);
+            }
+            const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+            if (srcset) {
+                for (const part of srcset.split(",")) vals.push(part.trim().split(" ")[0]);
+            }
+            return vals;
+        })"""
+    )
+    for v in img_data:
+        if v:
+            urls.add(urljoin(base_url, v))
+
+    # source tags
+    source_data = await page.eval_on_selector_all(
+        "source",
+        """els => els.flatMap(el => {
+            const vals = [];
+            const srcset = el.getAttribute("srcset") || el.getAttribute("data-srcset");
+            if (srcset) {
+                for (const part of srcset.split(",")) vals.push(part.trim().split(" ")[0]);
+            }
+            return vals;
+        })"""
+    )
+    for v in source_data:
+        if v:
+            urls.add(urljoin(base_url, v))
+
+    # OpenGraph/Twitter images
+    meta_data = await page.eval_on_selector_all(
+        "meta",
+        """els => els.map(m => m.getAttribute("content")).filter(Boolean)"""
+    )
+    for v in meta_data:
+        if looks_like_asset(v):
+            urls.add(urljoin(base_url, v))
+
+    # CSS background images
+    bg_data = await page.evaluate(
+        """() => {
+            const out = [];
+            for (const el of document.querySelectorAll("*")) {
+                const s = getComputedStyle(el);
+                const bg = s.backgroundImage || "";
+                if (bg && bg.includes("url(")) out.push(bg);
+            }
+            return out;
+        }"""
+    )
+    for style in bg_data:
+        for match in re.findall(r'url\(["\\\']?(.*?)["\\\']?\)', style):
+            if match and not match.startswith("data:"):
+                urls.add(urljoin(base_url, match))
+
+    # Filter tiny known assets
+    cleaned = []
+    for u in urls:
+        if not u.startswith("http"):
+            continue
+        low = u.lower()
+        if any(x in low for x in ["logo", "favicon", "sprite", "icon"]):
+            continue
+        cleaned.append(u)
+
+    return list(dict.fromkeys(cleaned))
+
+
+async def fetch_image_bytes(url: str, referer: str) -> bytes | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     }
-    """
-    vals = await page.evaluate(js)
-    for val in vals:
-        for part in str(val).split(","):
-            candidates = re.findall(r'https?://[^\s\)"\']+', part)
-            candidates += re.findall(r'url\(["\']?([^"\')]+)', part)
-            if not candidates:
-                candidates = [part.strip()]
-            for c in candidates:
-                u = normalize_url(c, base_url)
-                if u:
-                    low = u.lower()
-                    if any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", "image"]):
-                        urls.add(u)
-    return list(urls)[:MAX_IMAGES_PER_LISTING]
-
-
-async def fetch_image(url: str) -> tuple[bytes | None, str | None]:
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
             r = await client.get(url)
+            if r.status_code >= 400:
+                return None
             ct = r.headers.get("content-type", "")
-            if r.status_code >= 400 or "image" not in ct:
-                return None, f"HTTP {r.status_code} {ct}"
-            data = r.content
-            if len(data) < 2000:
-                return None, "image too small"
-            return data, None
-    except Exception as e:
-        return None, str(e)
+            if "image" not in ct and not looks_like_asset(url):
+                return None
+            return r.content
+    except Exception:
+        return None
 
 
-def image_sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def prepare_image(data: bytes) -> tuple[bytes | None, str | None]:
+def image_fingerprint(data: bytes) -> str | None:
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        w, h = img.size
-        if w < 120 or h < 120:
-            return None, "image dimensions too small"
-        img.thumbnail((1400, 1400))
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=84)
-        return out.getvalue(), None
-    except Exception as e:
-        return None, str(e)
+        im = Image.open(io.BytesIO(data))
+        im.thumbnail((512, 512))
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, format="JPEG", quality=75)
+        return hashlib.sha256(buf.getvalue()).hexdigest()
+    except Exception:
+        return hashlib.sha256(data).hexdigest()
 
 
-async def analyze_image(client: AsyncOpenAI, jpg: bytes) -> dict[str, Any]:
-    b64 = base64.b64encode(jpg).decode("ascii")
-    prompt = """Detect ANY visible sign or intentionally displayed text in this image. This includes signs, labels, notes, paper, posters, cards, boards, screens, handwritten text, printed text, verification signs, usernames, dates, or any object containing readable displayed text. It does not need to be held by a person. Return JSON only with: sign_detected boolean, sign_type string, text_visible string, description string, confidence low/medium/high. If none, sign_detected false."""
+def to_data_url(data: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+async def analyze_image(client: AsyncOpenAI, data: bytes) -> dict[str, Any]:
+    b64 = base64.b64encode(data).decode("ascii")
     resp = await client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        ]}],
+        messages=[
+            {"role": "system", "content": "You are a strict visual sign/text detector. Return JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": VISION_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            ]}
+        ],
         response_format={"type": "json_object"},
-        max_tokens=350,
+        temperature=0,
     )
-    txt = resp.choices[0].message.content or "{}"
-    return json.loads(txt)
+    text = resp.choices[0].message.content or "{}"
+    return json.loads(text)
 
 
-def render_html(body: str) -> str:
-    return f"""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>{APP_NAME}</title>
-<style>body{{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:24px;color:#111}}.card{{background:white;border-radius:22px;padding:22px;margin:0 auto 22px;max-width:880px;box-shadow:0 8px 30px #0001}}select,input,button{{font-size:18px;padding:12px;border-radius:12px;border:1px solid #ccc;max-width:100%}}button{{background:#111;color:white;border:0;font-weight:700}}table{{width:100%;border-collapse:collapse}}td{{border-top:1px solid #ddd;padding:12px;vertical-align:top}}td:first-child{{font-weight:700;width:45%}}img{{max-width:100%;border-radius:14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px}}</style></head><body>{body}</body></html>"""
+async def scan_site(target_url: str, max_pages: int = 1, max_links: int = 10, max_images: int = 40) -> tuple[Diagnostics, list[dict[str, Any]]]:
+    target_url = normalize_url(target_url)
+    diag = Diagnostics(target_url=target_url)
+
+    if not target_url:
+        diag.likely_problem = "No website URL was provided."
+        return diag, []
+
+    if not OPENAI_API_KEY:
+        diag.likely_problem = "OPENAI_API_KEY is missing in Railway variables."
+        return diag, []
+
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    results = []
+    seen_images = set()
+    seen_sign_keys = set()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1365, "height": 1800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        )
+
+        page = await context.new_page()
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(3000)
+            await auto_scroll(page)
+            diag.pages_scanned += 1
+            links = await extract_links(page, target_url, max_links)
+            diag.candidate_links_found = len(links)
+        except Exception as e:
+            diag.extraction_errors.append(f"Could not open start URL: {e}")
+            links = []
+        finally:
+            await page.close()
+
+        # Include homepage too, because many websites put images directly there.
+        pages_to_scan = [target_url] + links[:max_links]
+        pages_to_scan = list(dict.fromkeys(pages_to_scan))[: max_links + 1]
+
+        for link in pages_to_scan:
+            if diag.images_scanned >= max_images:
+                break
+            pg = await context.new_page()
+            try:
+                await pg.goto(link, wait_until="domcontentloaded", timeout=45000)
+                await pg.wait_for_timeout(3000)
+                await auto_scroll(pg)
+                diag.listings_opened += 1
+
+                urls = await extract_image_urls(pg, link)
+                diag.images_found += len(urls)
+
+                scanned_on_page = 0
+                for img_url in urls:
+                    if diag.images_scanned >= max_images:
+                        break
+                    data = await fetch_image_bytes(img_url, link)
+                    if not data or len(data) < 2500:
+                        continue
+                    fp = image_fingerprint(data)
+                    if fp in seen_images:
+                        diag.duplicate_images_skipped_before_ai += 1
+                        continue
+                    seen_images.add(fp)
+
+                    diag.images_scanned += 1
+                    scanned_on_page += 1
+                    try:
+                        diag.openai_vision_calls += 1
+                        verdict = await analyze_image(client, data)
+                        if verdict.get("sign_detected"):
+                            text_key = re.sub(r"\s+", " ", (verdict.get("text_visible") or "").lower()).strip()
+                            desc_key = re.sub(r"\s+", " ", (verdict.get("description") or "").lower()).strip()
+                            sign_key = hashlib.sha256((text_key + "|" + desc_key).encode()).hexdigest()
+                            if sign_key in seen_sign_keys:
+                                diag.duplicate_signs_skipped += 1
+                                continue
+                            seen_sign_keys.add(sign_key)
+                            results.append({
+                                "page_url": link,
+                                "image_url": img_url,
+                                "preview": to_data_url(data[:]) if len(data) < 4_000_000 else "",
+                                "verdict": verdict,
+                            })
+                    except Exception as e:
+                        diag.openai_api_errors.append(str(e)[:300])
+
+                # Fallback: if no downloadable images, scan screenshot of rendered page.
+                if scanned_on_page == 0 and diag.images_scanned < max_images:
+                    try:
+                        shot = await pg.screenshot(full_page=True, type="jpeg", quality=75)
+                        fp = image_fingerprint(shot)
+                        if fp not in seen_images:
+                            seen_images.add(fp)
+                            diag.images_scanned += 1
+                            diag.screenshot_fallbacks_scanned += 1
+                            diag.openai_vision_calls += 1
+                            verdict = await analyze_image(client, shot)
+                            if verdict.get("sign_detected"):
+                                text_key = re.sub(r"\s+", " ", (verdict.get("text_visible") or "").lower()).strip()
+                                desc_key = re.sub(r"\s+", " ", (verdict.get("description") or "").lower()).strip()
+                                sign_key = hashlib.sha256((text_key + "|" + desc_key).encode()).hexdigest()
+                                if sign_key not in seen_sign_keys:
+                                    seen_sign_keys.add(sign_key)
+                                    results.append({
+                                        "page_url": link,
+                                        "image_url": "rendered page screenshot",
+                                        "preview": to_data_url(shot),
+                                        "verdict": verdict,
+                                    })
+                    except Exception as e:
+                        diag.extraction_errors.append(f"Screenshot fallback failed: {e}")
+
+            except Exception as e:
+                diag.extraction_errors.append(f"Page failed {link}: {e}")
+            finally:
+                await pg.close()
+
+        await context.close()
+        await browser.close()
+
+    diag.signs_found = len(results)
+
+    if diag.candidate_links_found == 0 and diag.listings_opened <= 1:
+        diag.likely_problem = "No internal listing/detail links were found. The app scanned the submitted page directly using screenshot fallback."
+    elif diag.images_found == 0 and diag.screenshot_fallbacks_scanned == 0:
+        diag.likely_problem = "No usable images or screenshots were found."
+    elif diag.openai_vision_calls == 0:
+        diag.likely_problem = "Nothing reached OpenAI Vision."
+    elif diag.signs_found == 0:
+        diag.likely_problem = "Images/screenshots were scanned, but no signs or displayed text were detected."
+    else:
+        diag.likely_problem = "Scan completed."
+
+    return diag, results
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "openai_key_present": bool(os.getenv("OPENAI_API_KEY")), "model": OPENAI_MODEL}
+    return {
+        "ok": True,
+        "openai_key_present": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    options = "".join(f"<option>{c}</option>" for c in CITY_URLS)
-    body = f"""<div class='card'><h1>{APP_NAME}</h1><form method='post' action='/scan'><p><label>City/location</label><br><select name='city'>{options}</select></p><p><label>Listings to open</label><br><input name='max_listings' type='number' min='1' max='50' value='{MAX_LISTINGS_DEFAULT}'></p><button type='submit'>Start scan</button></form><p><a href='/health'>Health check</a></p></div>"""
-    return render_html(body)
+async def index():
+    return """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Any Website Sign Scanner</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:24px;color:#111}
+.card{background:white;border-radius:22px;padding:24px;margin:0 auto 24px;max-width:760px;box-shadow:0 8px 24px #0001}
+h1{font-size:36px;margin:0 0 16px}
+label{font-weight:700;display:block;margin-top:14px}
+input,select{font-size:18px;width:100%;box-sizing:border-box;padding:14px;border:1px solid #ccc;border-radius:12px}
+button{font-size:20px;font-weight:800;padding:16px 22px;border:0;border-radius:14px;background:#111;color:#fff;margin-top:18px;width:100%}
+.small{color:#555;font-size:14px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Any Website Sign Scanner</h1>
+<form method="post" action="/scan">
+<label>Website URL</label>
+<input name="target_url" placeholder="https://example.com or https://leolist.cc" required>
+
+<label>Max internal pages/listings to open</label>
+<input name="max_links" type="number" value="10" min="0" max="50">
+
+<label>Max images/screenshots to scan</label>
+<input name="max_images" type="number" value="40" min="1" max="100">
+
+<button type="submit">Start scan</button>
+<p class="small">Scans any website URL you enter. Duplicate images are skipped before OpenAI calls.</p>
+</form>
+</div>
+</body>
+</html>
+"""
 
 
 @app.post("/scan", response_class=HTMLResponse)
-async def scan(request: Request, city: str = Form(...), max_listings: int = Form(MAX_LISTINGS_DEFAULT)):
-    diag: dict[str, Any] = {
-        "OPENAI_API_KEY present": "yes" if os.getenv("OPENAI_API_KEY") else "no",
-        "Selected location": city,
-        "Listings found": 0,
-        "Listings opened": 0,
-        "Images found": 0,
-        "Images scanned": 0,
-        "OpenAI vision calls": 0,
-        "OpenAI/API errors": "none",
-        "Duplicate images skipped before AI": 0,
-        "Duplicate signs skipped": 0,
-        "Extraction errors": "none",
+async def scan(
+    target_url: str = Form(...),
+    max_links: int = Form(10),
+    max_images: int = Form(40),
+):
+    diag, results = await scan_site(target_url, max_links=max_links, max_images=max_images)
+
+    rows = [
+        ("Target URL", html_escape(diag.target_url)),
+        ("Pages scanned", diag.pages_scanned),
+        ("Candidate links found", diag.candidate_links_found),
+        ("Pages/listings opened", diag.listings_opened),
+        ("Images found", diag.images_found),
+        ("Images/screenshots scanned", diag.images_scanned),
+        ("Screenshot fallbacks scanned", diag.screenshot_fallbacks_scanned),
+        ("OpenAI vision calls", diag.openai_vision_calls),
+        ("OpenAI/API errors", "none" if not diag.openai_api_errors else "<br>".join(map(html_escape, diag.openai_api_errors[:5]))),
+        ("Extraction errors", "none" if not diag.extraction_errors else "<br>".join(map(html_escape, diag.extraction_errors[:5]))),
+        ("Duplicate images skipped before AI", diag.duplicate_images_skipped_before_ai),
+        ("Duplicate signs skipped", diag.duplicate_signs_skipped),
+        ("Likely problem", html_escape(diag.likely_problem)),
+    ]
+    row_html = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows)
+
+    result_html = ""
+    for r in results:
+        v = r["verdict"]
+        img = f'<img src="{r["preview"]}" style="max-width:100%;border-radius:14px">' if r.get("preview") else ""
+        result_html += f"""
+        <div class="result">
+            {img}
+            <p><b>Page:</b> <a href="{html_escape(r['page_url'])}">{html_escape(r['page_url'])}</a></p>
+            <p><b>Image:</b> {html_escape(r['image_url'])}</p>
+            <p><b>Type:</b> {html_escape(v.get('sign_type',''))}</p>
+            <p><b>Text:</b> {html_escape(v.get('text_visible',''))}</p>
+            <p><b>Description:</b> {html_escape(v.get('description',''))}</p>
+            <p><b>Confidence:</b> {html_escape(v.get('confidence',''))}</p>
+        </div>
+        """
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan Results</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:24px;color:#111}}
+.card{{background:white;border-radius:22px;padding:24px;margin:0 auto 24px;max-width:860px;box-shadow:0 8px 24px #0001}}
+h1{{font-size:34px;margin:0 0 16px}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:12px;font-size:17px}}
+th{{width:45%;font-weight:800}}
+.result{{border-top:1px solid #ddd;padding:18px 0}}
+a{{color:#551a8b}}
+button{{font-size:18px;font-weight:800;padding:14px 18px;border:0;border-radius:14px;background:#111;color:#fff}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Scan diagnostics</h1>
+<table>{row_html}</table>
+</div>
+<div class="card">
+<h1>{len(results)} unique sign(s) found</h1>
+{result_html if result_html else "<p>No signs found. Try a different website URL, more pages, or more images.</p>"}
+<p><a href="/">Run another scan</a></p>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/scan.json")
+async def scan_json(target_url: str, max_links: int = 10, max_images: int = 40):
+    diag, results = await scan_site(target_url, max_links=max_links, max_images=max_images)
+    return JSONResponse({"diagnostics": diag.__dict__, "results": results})
+
+
+@app.get("/selftest")
+async def selftest():
+    """
+    Runtime test that does not call OpenAI and does not need internet.
+    It verifies FastAPI, Playwright browser launch, link extraction,
+    image extraction, screenshot fallback path, and duplicate handling helpers.
+    """
+    import tempfile
+    from pathlib import Path
+    from PIL import Image, ImageDraw
+
+    report = {
+        "fastapi": True,
+        "playwright_browser_launch": False,
+        "mock_page_loaded": False,
+        "links_extracted": 0,
+        "images_extracted": 0,
+        "screenshot_captured": False,
+        "image_fingerprint": False,
+        "ok": False,
+        "error": "",
     }
-    found: list[FoundSign] = []
-    seen_image_hashes = set()
-    seen_sign_keys = set()
-    errors = []
 
-    if city not in CITY_URLS:
-        return JSONResponse({"error": "Invalid city", "valid": list(CITY_URLS)}, status_code=400)
-    if not os.getenv("OPENAI_API_KEY"):
-        diag["Likely problem"] = "OPENAI_API_KEY is missing in Railway Variables."
-        return HTMLResponse(render_result(diag, found))
-
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    max_listings = max(1, min(int(max_listings), 50))
-
+    tmp = tempfile.TemporaryDirectory()
     try:
+        site = Path(tmp.name)
+        img = Image.new("RGB", (640, 360), "white")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((60, 100, 580, 250), outline="black", width=5)
+        draw.text((110, 160), "SELFTEST SIGN 123", fill="black")
+        img.save(site / "sign.jpg", "JPEG")
+
+        html = """
+        <html><body>
+        <a href="/listing/123">Mock listing</a>
+        <img src="/sign.jpg">
+        <div style="background-image:url('/sign.jpg');width:640px;height:360px"></div>
+        </body></html>
+        """
+
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148", viewport={"width": 390, "height": 1200})
-            page = await context.new_page()
-            links = await collect_listing_links(page, CITY_URLS[city], max_listings)
-            diag["Listings found"] = len(links)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            report["playwright_browser_launch"] = True
+            page = await browser.new_page()
+            await page.set_content(html, wait_until="domcontentloaded")
+            report["mock_page_loaded"] = True
 
-            for link in links:
-                if diag["OpenAI vision calls"] >= MAX_AI_CALLS:
-                    break
-                ad = await context.new_page()
-                try:
-                    await safe_goto(ad, link)
-                    diag["Listings opened"] += 1
-                    img_urls = await extract_images(ad, link)
-                    diag["Images found"] += len(img_urls)
-                    for img_url in img_urls:
-                        raw, err = await fetch_image(img_url)
-                        if not raw:
-                            continue
-                        h = image_sha(raw)
-                        if h in seen_image_hashes:
-                            diag["Duplicate images skipped before AI"] += 1
-                            continue
-                        seen_image_hashes.add(h)
-                        jpg, prep_err = prepare_image(raw)
-                        if not jpg:
-                            continue
-                        diag["Images scanned"] += 1
-                        try:
-                            diag["OpenAI vision calls"] += 1
-                            result = await analyze_image(client, jpg)
-                        except Exception as e:
-                            errors.append(str(e)[:180])
-                            continue
-                        if result.get("sign_detected"):
-                            text = str(result.get("text_visible") or "").strip().lower()
-                            desc = str(result.get("description") or "").strip().lower()
-                            sign_key = hashlib.sha256((text + "|" + desc).encode()).hexdigest()
-                            if sign_key in seen_sign_keys:
-                                diag["Duplicate signs skipped"] += 1
-                                continue
-                            seen_sign_keys.add(sign_key)
-                            fname = f"sign_{now_id()}_{len(found)+1}.jpg"
-                            path = os.path.join(RESULT_DIR, fname)
-                            with open(path, "wb") as f:
-                                f.write(jpg)
-                            found.append(FoundSign(img_url, "/" + path, link, str(result.get("text_visible") or ""), str(result.get("sign_type") or ""), str(result.get("description") or ""), str(result.get("confidence") or ""), h[:12]))
-                except Exception as e:
-                    errors.append(str(e)[:180])
-                finally:
-                    await ad.close()
+            base_url = "https://example.com"
+            links = await extract_links(page, base_url, 10)
+            imgs = await extract_image_urls(page, base_url)
+            shot = await page.screenshot(type="jpeg", quality=75)
+
+            report["links_extracted"] = len(links)
+            report["images_extracted"] = len(imgs)
+            report["screenshot_captured"] = bool(shot and len(shot) > 1000)
+            report["image_fingerprint"] = bool(image_fingerprint(shot))
+
+            await page.close()
             await browser.close()
+
+        report["ok"] = (
+            report["playwright_browser_launch"]
+            and report["mock_page_loaded"]
+            and report["links_extracted"] >= 1
+            and report["images_extracted"] >= 1
+            and report["screenshot_captured"]
+            and report["image_fingerprint"]
+        )
     except Exception as e:
-        errors.append(str(e)[:250])
+        report["error"] = str(e)
+    finally:
+        tmp.cleanup()
 
-    if errors:
-        diag["OpenAI/API errors"] = "; ".join(errors[:4])
-    if diag["Listings found"] == 0:
-        diag["Likely problem"] = "No listing links were found. The site may have changed its HTML, blocked access, or the selected city has no visible listings."
-    elif diag["Images found"] == 0:
-        diag["Likely problem"] = "Listings opened, but no usable image URLs were found. The extractor may need a site-specific selector update."
-    elif diag["OpenAI vision calls"] == 0:
-        diag["Likely problem"] = "Images were found, but none were usable after download/filtering."
-    elif not found:
-        diag["Likely problem"] = "Images were scanned, but no signs or displayed text were detected. Try more listings."
-    else:
-        diag["Likely problem"] = "none"
-
-    return HTMLResponse(render_result(diag, found))
-
-
-def render_result(diag: dict[str, Any], found: list[FoundSign]) -> str:
-    rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in diag.items())
-    cards = "".join(f"<div><img src='{s.saved_path}'><p><b>Text:</b> {s.text_visible or 'unknown'}</p><p><b>Type:</b> {s.sign_type}</p><p>{s.description}</p><p><a href='{s.listing_url}'>Listing</a></p></div>" for s in found)
-    if not cards:
-        cards = "<p>No signs found. Try more listings/pages.</p>"
-    body = f"<div class='card'><h1>Scan diagnostics</h1><table>{rows}</table></div><div class='card'><h1>{len(found)} unique sign(s) found</h1><div class='grid'>{cards}</div><p><a href='/'>Run another scan</a></p></div>"
-    return render_html(body)
+    return report
