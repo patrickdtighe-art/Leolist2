@@ -144,59 +144,134 @@ def likely_detail_link(url: str, base: str) -> bool:
         return False
     parsed = urlparse(url)
     p = parsed.path.lower()
+    q = parsed.query.lower()
     if not p or p == "/":
         return False
     if bad_link_path(p):
         return False
-    # keep broad for any website, but avoid pure category loops where possible
-    if re.search(r"/\d{4,}|[?&](id|ad|post|listing)=", url.lower()):
+
+    detail_words = [
+        "ad", "ads", "post", "posting", "listing", "profile", "gallery",
+        "personals", "escort", "escorts", "female", "service"
+    ]
+    if any(x in p for x in detail_words):
         return True
-    if any(x in p for x in ["post", "ad", "ads", "listing", "profile", "gallery", "personals"]):
+    if re.search(r"/[a-z0-9_-]*\d{3,}[a-z0-9_-]*(/|$)", p):
         return True
-    # fallback: any deeper internal path may be a listing on unknown sites
+    if re.search(r"(^|&)(id|ad|post|listing|item|pid|aid)=", q):
+        return True
+
     return p.count("/") >= 2
 
 
-async def auto_scroll(page, steps: int = 6):
+async def auto_scroll(page, steps: int = 12):
     for _ in range(steps):
         await page.mouse.wheel(0, 1600)
         await page.wait_for_timeout(650)
 
 
 async def dismiss_common_modals(page):
-    selectors = [
+    checkbox_selectors = [
+        "input[type='checkbox']",
+        "label:has-text('I have read')",
+        "label:has-text('I agree')",
+        "label:has-text('agree')",
+    ]
+    for sel in checkbox_selectors:
+        try:
+            els = await page.query_selector_all(sel)
+            for el in els[:3]:
+                try:
+                    await el.click(timeout=1200)
+                    await page.wait_for_timeout(300)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    button_selectors = [
+        "button:has-text('Continue')",
         "button:has-text('Accept')",
         "button:has-text('I Agree')",
         "button:has-text('Agree')",
-        "button:has-text('Continue')",
         "button:has-text('Enter')",
         "button:has-text('Close')",
-        "text=I have read and agree",
+        "input[type='submit']",
+        "[role='button']:has-text('Continue')",
+        "[role='button']:has-text('Agree')",
+        "a:has-text('Continue')",
+        "a:has-text('Enter')",
     ]
-    for sel in selectors:
+    for sel in button_selectors:
         try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.click(timeout=1500)
-                await page.wait_for_timeout(800)
+            els = await page.query_selector_all(sel)
+            for el in els[:3]:
+                try:
+                    await el.click(timeout=1500)
+                    await page.wait_for_timeout(900)
+                except Exception:
+                    pass
         except Exception:
             pass
 
 
 async def extract_links(page, base_url: str, max_links: int) -> list[str]:
-    raw = await page.eval_on_selector_all("a[href]", "els => els.map(a => a.href).filter(Boolean)")
+    raw = await page.evaluate(
+        """() => {
+            const out = [];
+            const attrs = ["href","data-href","data-url","data-link","data-target","to"];
+            for (const el of document.querySelectorAll("a, [href], [data-href], [data-url], [data-link], [onclick], article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad']")) {
+                for (const a of attrs) {
+                    const v = el.getAttribute && el.getAttribute(a);
+                    if (v) out.push(v);
+                }
+                const oc = el.getAttribute && el.getAttribute("onclick");
+                if (oc) out.push(oc);
+                const inner = el.querySelector && el.querySelector("a[href]");
+                if (inner && inner.href) out.push(inner.href);
+            }
+            return out;
+        }"""
+    )
+
     links = []
     seen = set()
-    for href in raw:
-        href = urljoin(base_url, href).split("#")[0]
-        if href in seen:
-            continue
-        if likely_detail_link(href, base_url):
-            seen.add(href)
-            links.append(href)
-        if len(links) >= max_links:
-            break
-    return links
+    url_pat = re.compile(r"""https?://[^\s'"<>]+|/[A-Za-z0-9_./?=&%-]+""")
+    for item in raw:
+        for m in url_pat.findall(str(item)):
+            href = urljoin(base_url, m).split("#")[0].rstrip(")")
+            if href in seen:
+                continue
+            if likely_detail_link(href, base_url):
+                seen.add(href)
+                links.append(href)
+            if len(links) >= max_links:
+                return links
+
+    if len(links) < max_links:
+        try:
+            handles = await page.query_selector_all("article, .card, .listing, [class*='listing'], [class*='card'], [class*='ad']")
+            original = page.url
+            for h in handles[: max_links * 3]:
+                if len(links) >= max_links:
+                    break
+                try:
+                    await h.click(timeout=1000)
+                    await page.wait_for_timeout(1000)
+                    new_url = page.url.split("#")[0]
+                    if new_url != original and new_url not in seen and likely_detail_link(new_url, base_url):
+                        seen.add(new_url)
+                        links.append(new_url)
+                    if page.url != original:
+                        await page.goto(original, wait_until="domcontentloaded", timeout=20000)
+                        await dismiss_common_modals(page)
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return links[:max_links]
 
 
 async def extract_image_urls(page, base_url: str) -> list[str]:
@@ -385,6 +460,27 @@ async def scan_site(
             await auto_scroll(start)
             diag.pages_scanned += 1
             links = await extract_links(start, target_url, max_links)
+
+            if not links and "leolist" in target_url.lower():
+                parsed = urlparse(target_url)
+                parts = [x for x in parsed.path.split("/") if x]
+                parent_urls = []
+                for cut in range(len(parts) - 1, 1, -1):
+                    parent_urls.append(parsed.scheme + "://" + parsed.netloc + "/" + "/".join(parts[:cut]))
+                for parent in parent_urls[:3]:
+                    try:
+                        await start.goto(parent, wait_until="domcontentloaded", timeout=45000)
+                        await dismiss_common_modals(start)
+                        await start.wait_for_timeout(3000)
+                        await auto_scroll(start, steps=14)
+                        links = await extract_links(start, parent, max_links)
+                        if links:
+                            target_url = parent
+                            diag.target_url = parent
+                            break
+                    except Exception:
+                        pass
+
             diag.candidate_links_found = len(links)
         except Exception as e:
             diag.extraction_errors.append(f"Could not open start URL: {e}")
@@ -478,7 +574,7 @@ async def scan_site(
 
     diag.signs_found = len(results)
     if diag.candidate_links_found == 0 and diag.pages_opened <= 1:
-        diag.likely_problem = "No detail/listing links were found. Try a more specific page or another city/site."
+        diag.likely_problem = "No detail/listing links were found after aggressive extraction. Try Custom URL with the exact listings page."
     elif diag.images_found == 0:
         diag.likely_problem = "Pages opened, but no usable image URLs were found."
     elif diag.openai_vision_calls == 0:
