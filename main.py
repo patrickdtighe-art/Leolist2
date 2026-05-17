@@ -189,6 +189,8 @@ class Diagnostics:
     duplicate_images_skipped_before_ai: int = 0
     duplicate_signs_skipped: int = 0
     signs_found: int = 0
+    ads_opened: int = 0
+    all_image_urls_written: int = 0
     likely_problem: str = ""
 
 
@@ -250,6 +252,60 @@ def likely_detail_link(url: str, base: str) -> bool:
     return p.count("/") >= 2
 
 
+def strip_pagination_url(url: str) -> str:
+    """Return URL without common pagination markers so category pages are not mistaken for ads."""
+    try:
+        parsed = urlparse(url.split('#')[0])
+        q = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in {'page','p','pg','offset'}]
+        path = re.sub(r"/page/\d+/?$", "", parsed.path.rstrip('/'), flags=re.I)
+        # Do not strip a bare trailing number here; Leolist ad URLs may end in a numeric id.
+        return urlunparse(parsed._replace(path=path, query=urlencode(q), fragment='')).rstrip('/')
+    except Exception:
+        return (url or '').split('#')[0].rstrip('/')
+
+
+def likely_ad_detail_link(url: str, city_base: str) -> bool:
+    """True only for actual ad/detail pages, not city/category/pagination pages.
+
+    The previous crawler used likely_detail_link() directly. On Leolist that is too broad
+    because every city page contains words like personals/female-escorts, so pagination
+    and category pages were counted as ads. This function requires a real detail shape.
+    """
+    if not likely_detail_link(url, city_base):
+        return False
+    if not same_site(url, city_base):
+        return False
+    u = urlparse(url.split('#')[0])
+    b = urlparse(city_base.split('#')[0])
+    upath = u.path.rstrip('/').lower()
+    bpath = b.path.rstrip('/').lower()
+    if not upath or upath == '/':
+        return False
+    if bad_link_path(upath):
+        return False
+    # Reject the selected city/category page and common pagination/query variants.
+    if strip_pagination_url(url).lower() == strip_pagination_url(city_base).lower():
+        return False
+    if re.search(r"(^|&)(page|p|pg|offset)=\d+", u.query.lower()):
+        # Pagination URLs are city pages, not ads.
+        # Keep only if they also have a strong ad id parameter.
+        if not re.search(r"(^|&)(id|ad_id|listing_id|post_id|pid|aid)=\d{3,}", u.query.lower()):
+            return False
+    base_parts = [x for x in bpath.split('/') if x]
+    url_parts = [x for x in upath.split('/') if x]
+    if 'leolist.' in u.netloc.lower():
+        # Real ads are normally deeper than the city category or have a long numeric id/slug.
+        if len(url_parts) <= len(base_parts):
+            return False
+        extra = '/'.join(url_parts[len(base_parts):])
+        if re.search(r"\d{4,}", extra):
+            return True
+        if len(extra) >= 8 and not extra.isdigit():
+            return True
+        return False
+    return True
+
+
 async def auto_scroll(page, steps: int = 12):
     for _ in range(steps):
         await page.mouse.wheel(0, 1600)
@@ -301,7 +357,7 @@ async def dismiss_common_modals(page):
             pass
 
 
-async def extract_links(page, base_url: str, max_links: int | None = None) -> list[str]:
+async def extract_links(page, base_url: str, max_links: int | None = None, city_base_url: str | None = None) -> list[str]:
     raw = await page.evaluate(
         """() => {
             const out = [];
@@ -328,7 +384,8 @@ async def extract_links(page, base_url: str, max_links: int | None = None) -> li
             href = urljoin(base_url, m).split("#")[0].rstrip(")")
             if href in seen:
                 continue
-            if likely_detail_link(href, base_url):
+            is_detail = likely_ad_detail_link(href, city_base_url or base_url) if city_base_url else likely_detail_link(href, base_url)
+            if is_detail:
                 seen.add(href)
                 links.append(href)
             if max_links and len(links) >= max_links:
@@ -346,7 +403,8 @@ async def extract_links(page, base_url: str, max_links: int | None = None) -> li
                     await h.click(timeout=1000)
                     await page.wait_for_timeout(1000)
                     new_url = page.url.split("#")[0]
-                    if new_url != original and new_url not in seen and likely_detail_link(new_url, base_url):
+                    is_detail = likely_ad_detail_link(new_url, city_base_url or base_url) if city_base_url else likely_detail_link(new_url, base_url)
+                    if new_url != original and new_url not in seen and is_detail:
                         seen.add(new_url)
                         links.append(new_url)
                     if page.url != original:
@@ -456,6 +514,77 @@ async def extract_image_urls(page, base_url: str) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+
+
+async def expand_ad_gallery_and_collect_images(page, base_url: str, job: ScanJob | None = None) -> list[str]:
+    """Collect images from an individual ad page, including lazy galleries.
+
+    This deliberately runs only after an ad/detail URL is opened. It does not scan
+    the city listing page as an ad. It also clicks visible gallery thumbnails so
+    photos that only load in a modal/carousel get captured.
+    """
+    collected: list[str] = []
+
+    async def add_current_images():
+        try:
+            for u in await extract_image_urls(page, base_url):
+                if u not in collected:
+                    collected.append(u)
+        except Exception as e:
+            log_job(job, f"Image extraction pass failed: {e}")
+
+    await add_current_images()
+
+    # Leolist and similar sites often lazy-load full photos after scrolling.
+    try:
+        await auto_scroll(page, steps=18)
+    except Exception:
+        pass
+    await add_current_images()
+
+    # Click likely thumbnails / gallery controls. Keep this bounded so full-city
+    # scans do not get stuck on one ad.
+    selectors = [
+        "img",
+        "picture img",
+        "[class*='gallery'] img",
+        "[class*='photo'] img",
+        "[class*='image'] img",
+        "[class*='thumb'] img",
+        "a[href*='.jpg'], a[href*='.jpeg'], a[href*='.png'], a[href*='.webp']",
+        "button[aria-label*='next' i]",
+        "button:has-text('Next')",
+        "a:has-text('Next')",
+        "[class*='next']",
+    ]
+    clicked = 0
+    for sel in selectors:
+        try:
+            els = await page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els[:30]:
+            if clicked >= 60:
+                break
+            try:
+                await el.scroll_into_view_if_needed(timeout=1000)
+                await el.click(timeout=1200, force=True)
+                clicked += 1
+                await page.wait_for_timeout(550)
+                await add_current_images()
+            except Exception:
+                pass
+        if clicked >= 60:
+            break
+
+    # One more pass after possible modal/carousel opens.
+    try:
+        await page.keyboard.press('Escape')
+    except Exception:
+        pass
+    await add_current_images()
+
+    return list(dict.fromkeys(collected))
 
 async def fetch_image_bytes(url: str, referer: str) -> bytes | None:
     headers = {
@@ -607,10 +736,11 @@ async def discover_city_listing_pages(context, start_url: str, max_links: int | 
             except Exception as dbg_e:
                 log_job(job, f"Debug capture failed: {dbg_e}")
 
-            extracted_now = await extract_links(page, city_url, None)
+            extracted_now = await extract_links(page, city_url, None, start_url)
             write_debug_text(job, "links.txt", "\n".join(extracted_now))
+            log_job(job, f"Ad/detail links extracted from this city page: {len(extracted_now)}")
             for link in extracted_now:
-                if link not in seen_listing_links and likely_detail_link(link, start_url):
+                if link not in seen_listing_links and likely_ad_detail_link(link, start_url):
                     seen_listing_links.add(link)
                     listing_links.append(link)
                     if max_links and len(listing_links) >= max_links:
@@ -778,10 +908,12 @@ async def scan_site(
         finally:
             await start.close()
 
-        # scan start page too, but screenshot fallback remains off by default
-        pages = [target_url] + links
-        pages = list(dict.fromkeys(pages))
+        # Open and scan ONLY individual ad/detail pages. Do not scan the city/category
+        # page as an ad because that creates false results and hides crawler bugs.
+        pages = [u for u in dict.fromkeys(links) if likely_ad_detail_link(u, target_url)]
+        write_debug_text(job, "opened_ad_urls.txt", "")
         effective_max_images = max_images if max_images and max_images > 0 else None
+        all_image_urls: list[str] = []
 
         for link in pages:
             if effective_max_images and diag.images_scanned >= effective_max_images:
@@ -821,7 +953,7 @@ async def scan_site(
 
                     diag.images_scanned += 1
                     scanned_on_page += 1
-                    set_job_message(job, f"AI scanning image {diag.images_scanned}; page {diag.pages_opened + 1}/{len(pages)}")
+                    set_job_message(job, f"AI scanning image {diag.images_scanned}; ad {diag.pages_opened}/{len(pages)}")
                     try:
                         diag.openai_vision_calls += 1
                         verdict = await analyze_image(client, data)
@@ -874,8 +1006,8 @@ async def scan_site(
         set_job_message(job, "Browser closed")
 
     diag.signs_found = len(results)
-    if diag.candidate_links_found == 0 and diag.pages_opened <= 1:
-        diag.likely_problem = "No detail/listing links were found after aggressive extraction. Try Custom URL with the exact listings page."
+    if diag.candidate_links_found == 0 or not pages:
+        diag.likely_problem = "No real individual ad/detail links were found. The city page may be blocked or the ad URL selector needs another patch. Check all_listing_links.txt and latest-page.jpg."
     elif diag.images_found == 0:
         diag.likely_problem = "Pages opened, but no usable image URLs were found."
     elif diag.openai_vision_calls == 0:
@@ -1098,7 +1230,9 @@ def render_results_html(job: ScanJob) -> str:
         ("City pagination pages visited", diag.get("pagination_pages_visited", 0)),
         ("Listing/detail pages discovered", diag.get("listing_pages_discovered", 0)),
         ("Pages opened", diag.get("pages_opened", 0)),
+        ("Individual ads opened", diag.get("ads_opened", diag.get("pages_opened", 0))),
         ("Images found", diag.get("images_found", 0)),
+        ("Cumulative image URLs written", diag.get("all_image_urls_written", 0)),
         ("Images scanned", diag.get("images_scanned", 0)),
         ("Screenshot fallbacks scanned", diag.get("screenshot_fallbacks_scanned", 0)),
         ("OpenAI vision calls", diag.get("openai_vision_calls", 0)),
@@ -1130,7 +1264,9 @@ def render_results_html(job: ScanJob) -> str:
       <a href="/debug/{job.id}/latest-page.jpg">Latest city screenshot</a> |
       <a href="/debug/{job.id}/latest.html">Latest city HTML</a> |
       <a href="/debug/{job.id}/all_listing_links.txt">All listing links</a> |
+      <a href="/debug/{job.id}/opened_ad_urls.txt">Opened ad URLs</a> |
       <a href="/debug/{job.id}/images.txt">Latest image URLs</a> |
+      <a href="/debug/{job.id}/all_image_urls.txt">All image URLs</a> |
       <a href="/job/{job.id}.json">Job JSON</a>
     </p>
     """
@@ -1182,7 +1318,7 @@ async def debug_file(job_id: str, filename: str):
     job = get_job(job_id)
     if not job:
         return PlainTextResponse("Job not found", status_code=404)
-    allowed = {"latest-page.jpg","latest-ad-page.jpg","latest.html","latest_text.txt","latest_url.txt","latest_ad.html","latest_ad_url.txt","links.txt","images.txt","all_listing_links.txt","live.log"}
+    allowed = {"latest-page.jpg","latest-ad-page.jpg","latest.html","latest_text.txt","latest_url.txt","latest_ad.html","latest_ad_url.txt","links.txt","images.txt","all_listing_links.txt","opened_ad_urls.txt","all_image_urls.txt","live.log"}
     if filename not in allowed:
         return PlainTextResponse("File not allowed", status_code=400)
     path = Path(job.debug_dir) / filename

@@ -74,3 +74,14 @@ Live pages/files:
 - `/debug/<job_id>/images.txt` - latest image URLs found
 
 Use these debug files if Leolist returns zero links or zero images. The screenshot/HTML will show whether Railway is blocked, redirected, or seeing a different page than Safari.
+
+## Individual-ad scanning patch
+
+This version does not scan the city/category page as an ad. It first discovers real ad/detail URLs, then opens each individual ad page, expands/scrolls/clicks likely galleries, extracts the ad photos, hashes images to skip duplicates, and runs the verification-sign detector only on those pictures.
+
+Useful debug links during a scan:
+- `/status/<job_id>` live status
+- `/debug/<job_id>/all_listing_links.txt` discovered ad/detail links
+- `/debug/<job_id>/opened_ad_urls.txt` ads actually opened
+- `/debug/<job_id>/all_image_urls.txt` cumulative image URLs found from opened ads
+- `/debug/<job_id>/latest-ad-page.jpg` screenshot of the latest opened ad
